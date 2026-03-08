@@ -4850,14 +4850,58 @@ fn create_robot_service(
     config: &RalphConfig,
     context: &LoopContext,
 ) -> Option<Box<dyn ralph_proto::RobotService>> {
-    let workspace_root = context.workspace().to_path_buf();
-    let bot_token = config.robot.resolve_bot_token();
-    let api_url = config.robot.resolve_api_url();
     let timeout_secs = config.robot.timeout_seconds.unwrap_or(300);
     let loop_id = context
         .loop_id()
         .map(String::from)
         .unwrap_or_else(|| "main".to_string());
+
+    if let Some(rc_config) = &config.robot.rocketchat {
+        let workspace_root = context.workspace().to_path_buf();
+
+        let auth_token = config
+            .robot
+            .resolve_rocketchat_auth_token()
+            .unwrap_or_default();
+        let server_url = config
+            .robot
+            .resolve_rocketchat_server_url()
+            .unwrap_or_default();
+        let bot_user_id = rc_config.bot_user_id.clone().unwrap_or_default();
+        let room_id = rc_config.room_id.clone().unwrap_or_default();
+        let operator_id = config.robot.operator_id.clone();
+
+        let client =
+            ralph_rocketchat::client::RocketChatClient::new(&server_url, &auth_token, &bot_user_id);
+
+        let service = ralph_rocketchat::service::RocketChatService::new(
+            workspace_root,
+            server_url,
+            auth_token,
+            bot_user_id,
+            room_id,
+            operator_id,
+            timeout_secs,
+            loop_id,
+            Box::new(client),
+        );
+
+        if let Err(e) = service.start() {
+            warn!(error = %e, "Failed to start Rocket.Chat robot service");
+            return None;
+        }
+        info!(
+            auth_token = %service.auth_token_masked(),
+            timeout_secs = service.timeout_secs(),
+            "Robot human-in-the-loop service active (Rocket.Chat)"
+        );
+        return Some(Box::new(service));
+    }
+
+    // Telegram backend (default)
+    let workspace_root = context.workspace().to_path_buf();
+    let bot_token = config.robot.resolve_bot_token();
+    let api_url = config.robot.resolve_api_url();
 
     match ralph_telegram::TelegramService::new(
         workspace_root,

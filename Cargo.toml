@@ -9,6 +9,7 @@ members = [
     "crates/ralph-bench",
     "crates/ralph-e2e",
     "crates/ralph-telegram",
+    "crates/ralph-rocketchat",
     "crates/ralph-api",
 ]
 exclude = [
@@ -147,6 +148,7 @@ ralph-cli = { version = "2.8.1", path = "crates/ralph-cli" }
 ralph-bench = { version = "2.8.1", path = "crates/ralph-bench" }
 ralph-e2e = { version = "2.8.1", path = "crates/ralph-e2e" }
 ralph-telegram = { version = "2.8.1", path = "crates/ralph-telegram" }
+ralph-rocketchat = { version = "2.8.0", path = "crates/ralph-rocketchat" }
 ralph-api = { version = "2.8.1", path = "crates/ralph-api" }
 
 # Telegram bot framework

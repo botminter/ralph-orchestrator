@@ -3513,6 +3513,248 @@ RObot:
     }
 
     #[test]
+    fn test_robot_config_validate_mutual_exclusion() {
+        // Both telegram and rocketchat configured → MutuallyExclusive error
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: Some(TelegramBotConfig {
+                bot_token: Some("test-token".to_string()),
+                api_url: None,
+            }),
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::MutuallyExclusive { field1, field2 }
+                if field1 == "RObot.telegram" && field2 == "RObot.rocketchat"),
+            "Expected MutuallyExclusive error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_rocketchat_valid() {
+        // Skip if env vars would interfere
+        if std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_ok() {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+        assert!(robot.validate().is_ok());
+    }
+
+    #[test]
+    fn test_robot_config_validate_rocketchat_missing_auth_token() {
+        // RC section present but auth_token missing → error
+        if std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_ok() {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: None,
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.rocketchat.auth_token"),
+            "Expected auth_token validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_rocketchat_missing_server_url() {
+        if std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_ok()
+            || std::env::var("RALPH_ROCKETCHAT_SERVER_URL").is_ok()
+        {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: None,
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.rocketchat.server_url"),
+            "Expected server_url validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_rocketchat_missing_bot_user_id() {
+        if std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_ok()
+            || std::env::var("RALPH_ROCKETCHAT_SERVER_URL").is_ok()
+        {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: None,
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.rocketchat.bot_user_id"),
+            "Expected bot_user_id validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_resolve_rocketchat_auth_token_from_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: None,
+                bot_user_id: None,
+                auth_token: Some("config-rc-token".to_string()),
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_rocketchat_auth_token();
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn test_robot_config_resolve_rocketchat_auth_token_none_without_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_rocketchat_auth_token();
+        if std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_err() {
+            assert!(resolved.is_none());
+        }
+    }
+
+    #[test]
+    fn test_robot_config_resolve_rocketchat_server_url_from_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: None,
+                auth_token: None,
+                room_id: None,
+            }),
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_rocketchat_server_url();
+        if std::env::var("RALPH_ROCKETCHAT_SERVER_URL").is_err() {
+            assert_eq!(resolved.as_deref(), Some("https://chat.example.com"));
+        }
+    }
+
+    #[test]
+    fn test_robot_config_resolve_rocketchat_server_url_none_without_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_rocketchat_server_url();
+        if std::env::var("RALPH_ROCKETCHAT_SERVER_URL").is_err() {
+            assert!(resolved.is_none());
+        }
+    }
+
+    #[test]
+    fn test_robot_config_operator_id_passthrough() {
+        // operator_id is stored and doesn't affect validation
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: Some(TelegramBotConfig {
+                bot_token: Some("test-token".to_string()),
+                api_url: None,
+            }),
+            rocketchat: None,
+            operator_id: Some("user-42".to_string()),
+        };
+        assert!(robot.validate().is_ok());
+        assert_eq!(robot.operator_id.as_deref(), Some("user-42"));
+    }
+
+    #[test]
     fn test_extra_instructions_merged_during_normalize() {
         let yaml = r#"
 _fragments:

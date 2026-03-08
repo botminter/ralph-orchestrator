@@ -196,6 +196,10 @@ pub struct ShowArgs {
 }
 
 /// Gets the tasks file path.
+///
+/// When `--root` is not provided, traverses up from CWD looking for `.ralph/`
+/// (like git does with `.git/`), so tasks resolve correctly even when the
+/// agent has `cd`'d into a subdirectory.
 fn get_tasks_path(root: Option<&PathBuf>) -> PathBuf {
     resolve_path_from_workspace(".ralph/agent/tasks.jsonl", root)
 }

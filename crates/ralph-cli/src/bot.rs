@@ -27,7 +27,7 @@ pub struct BotArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BotCommands {
-    /// Interactive setup wizard for Telegram bot
+    /// Interactive setup wizard for RObot backend (Telegram or Rocket.Chat)
     Onboard(OnboardArgs),
     /// Check current bot configuration status
     Status,
@@ -41,17 +41,43 @@ pub enum BotCommands {
 
 #[derive(Parser, Debug)]
 pub struct OnboardArgs {
-    /// Skip interactive token prompt, provide token directly
+    /// Backend to onboard: "telegram" (default) or "rocketchat"
+    #[arg(long, default_value = "telegram")]
+    pub backend: String,
+
+    // ── Telegram-specific flags ──────────────────────────────────────────
+    /// Skip interactive token prompt, provide token directly (Telegram)
     #[arg(long)]
     pub token: Option<String>,
 
-    /// Skip chat_id detection, provide chat_id directly
+    /// Skip chat_id detection, provide chat_id directly (Telegram)
     #[arg(long)]
     pub chat_id: Option<i64>,
 
-    /// Timeout in seconds for waiting for a Telegram message
+    /// Timeout in seconds for waiting for a Telegram message (Telegram)
     #[arg(long, default_value = "120")]
     pub timeout: u64,
+
+    // ── Rocket.Chat-specific flags ───────────────────────────────────────
+    /// Rocket.Chat server URL (e.g., https://chat.example.com)
+    #[arg(long)]
+    pub server_url: Option<String>,
+
+    /// Rocket.Chat bot user ID (for X-User-Id header)
+    #[arg(long)]
+    pub bot_user_id: Option<String>,
+
+    /// Rocket.Chat Personal Access Token
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Rocket.Chat room ID where the bot operates
+    #[arg(long)]
+    pub room_id: Option<String>,
+
+    /// Operator user ID for filtering messages in group chats
+    #[arg(long)]
+    pub operator_id: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -98,7 +124,14 @@ pub async fn execute(
     use_colors: bool,
 ) -> Result<()> {
     match args.command {
-        BotCommands::Onboard(onboard_args) => onboard_telegram(onboard_args, use_colors).await,
+        BotCommands::Onboard(onboard_args) => match onboard_args.backend.as_str() {
+            "telegram" => onboard_telegram(onboard_args, use_colors).await,
+            "rocketchat" => onboard_rocketchat(onboard_args, use_colors).await,
+            other => anyhow::bail!(
+                "Unknown backend {:?}. Supported backends: telegram, rocketchat",
+                other
+            ),
+        },
         BotCommands::Status => bot_status(use_colors).await,
         BotCommands::Test(test_args) => bot_test(test_args, use_colors).await,
         BotCommands::Token(token_args) => bot_token(token_args, use_colors),
@@ -336,6 +369,229 @@ async fn onboard_telegram(args: OnboardArgs, use_colors: bool) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ONBOARD — ROCKET.CHAT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn onboard_rocketchat(args: OnboardArgs, use_colors: bool) -> Result<()> {
+    use ralph_rocketchat::client::{RocketChatApi, RocketChatClient};
+
+    println!();
+    if use_colors {
+        println!("\x1b[1mRalph Rocket.Chat Bot Setup\x1b[0m");
+        println!("\x1b[1m===========================\x1b[0m");
+    } else {
+        println!("Ralph Rocket.Chat Bot Setup");
+        println!("===========================");
+    }
+    println!();
+
+    // Step 1: Get server URL
+    let server_url = if let Some(url) = args.server_url {
+        url
+    } else {
+        println!("Step 1: Rocket.Chat server URL");
+        println!("  e.g., https://chat.example.com");
+        println!();
+        prompt_input("  Server URL: ")?
+    };
+
+    // Step 2: Get bot user ID
+    let bot_user_id = if let Some(uid) = args.bot_user_id {
+        uid
+    } else {
+        println!();
+        println!("Step 2: Bot user ID");
+        println!("  The bot's Rocket.Chat user ID (used for X-User-Id header).");
+        println!("  Find it in Administration > Users > your bot user.");
+        println!();
+        prompt_input("  Bot user ID: ")?
+    };
+
+    // Step 3: Get auth token
+    let auth_token = if let Some(tok) = args.auth_token {
+        tok
+    } else {
+        println!();
+        println!("Step 3: Personal Access Token");
+        println!("  Create one in My Account > Personal Access Tokens.");
+        println!("  Ensure 'Ignore Two Factor Authentication' is checked.");
+        println!();
+        prompt_input("  Auth token: ")?
+    };
+
+    // Step 4: Validate credentials
+    println!();
+    println!("Step 4: Validate credentials");
+    print!("  Checking credentials with Rocket.Chat API...");
+    io::stdout().flush()?;
+
+    let client = RocketChatClient::new(&server_url, &auth_token, &bot_user_id);
+
+    let bot_info = match client.get_me().await {
+        Ok(info) => {
+            println!();
+            let display = info.name.as_deref().unwrap_or(&info.username);
+            print_success(
+                use_colors,
+                &format!("Credentials valid! Bot: {} (@{})", display, info.username),
+            );
+            info
+        }
+        Err(e) => {
+            println!();
+            print_error(use_colors, &format!("Credential validation failed: {e}"));
+            println!();
+            println!("  Troubleshooting:");
+            println!("    - Check that server_url is correct and reachable");
+            println!("    - Verify bot_user_id matches the bot's user in Rocket.Chat");
+            println!("    - Ensure the Personal Access Token hasn't been revoked");
+            println!("    - Check your internet connection");
+            anyhow::bail!("Credential validation failed");
+        }
+    };
+    // Confirm the user ID matches what the server reports
+    if bot_info.id != bot_user_id {
+        print_warning(
+            use_colors,
+            &format!(
+                "Provided bot_user_id ({}) differs from server-reported ID ({}). Using server value.",
+                bot_user_id, bot_info.id
+            ),
+        );
+    }
+
+    // Step 5: Get room ID
+    let room_id = if let Some(rid) = args.room_id {
+        rid
+    } else {
+        println!();
+        println!("Step 5: Room ID");
+        println!("  The room where Ralph will send messages.");
+        println!("  Find it in the room's kebab menu > Channel Administration > shows in URL.");
+        println!();
+        prompt_input("  Room ID: ")?
+    };
+
+    // Validate room
+    print!("  Checking room...");
+    io::stdout().flush()?;
+    match client.get_room_info(&room_id).await {
+        Ok(room) => {
+            println!();
+            let room_display = room
+                .fname
+                .as_deref()
+                .or(room.name.as_deref())
+                .unwrap_or(&room_id);
+            let room_type = match room.t.as_str() {
+                "c" => "channel",
+                "p" => "private group",
+                "d" => "direct message",
+                other => other,
+            };
+            print_success(
+                use_colors,
+                &format!("Room found: {} ({})", room_display, room_type),
+            );
+        }
+        Err(e) => {
+            println!();
+            print_warning(use_colors, &format!("Could not validate room: {e}"));
+            println!("    The bot may not have access. Setup will continue.");
+        }
+    }
+
+    // Step 6: Get operator ID
+    let operator_id = if let Some(oid) = args.operator_id {
+        Some(oid)
+    } else {
+        println!();
+        println!("Step 6: Operator ID (optional)");
+        println!("  In group chats, only messages from this user are processed.");
+        println!("  Leave blank for DMs or if filtering is not needed.");
+        println!();
+        let input = prompt_input_optional("  Operator user ID (or press Enter to skip): ")?;
+        if input.is_empty() { None } else { Some(input) }
+    };
+
+    // Step 7: Save configuration
+    println!();
+    println!("Step 7: Save configuration");
+
+    // Store auth token in keychain
+    match store_rocketchat_auth_token(&auth_token) {
+        Ok(()) => {
+            print_success(
+                use_colors,
+                "Auth token stored in OS keychain (ralph/rocketchat-auth-token)",
+            );
+        }
+        Err(e) => {
+            print_warning(
+                use_colors,
+                &format!("Could not store token in keychain: {e}"),
+            );
+            println!("    Set RALPH_ROCKETCHAT_AUTH_TOKEN env var instead.");
+        }
+    }
+
+    // Update ralph.yml
+    match save_rocketchat_config(&server_url, &bot_info.id, &room_id, operator_id.as_deref()) {
+        Ok(()) => {
+            print_success(
+                use_colors,
+                "Updated ralph.yml (RObot.rocketchat configured)",
+            );
+        }
+        Err(e) => {
+            print_warning(use_colors, &format!("Could not update ralph.yml: {e}"));
+            println!("    Add manually:");
+            println!("      RObot:");
+            println!("        enabled: true");
+            println!("        rocketchat:");
+            println!("          server_url: {}", server_url);
+            println!("          bot_user_id: {}", bot_info.id);
+            println!("          room_id: {}", room_id);
+            if let Some(ref oid) = operator_id {
+                println!("        operator_id: {}", oid);
+            }
+        }
+    }
+
+    // Step 8: Verify
+    println!();
+    println!("Step 8: Verify");
+
+    match client
+        .send_message(
+            &room_id,
+            "Ralph bot setup complete! I'm ready to assist during orchestration runs.",
+            None,
+        )
+        .await
+    {
+        Ok(_) => {
+            print_success(use_colors, "Test message sent to your Rocket.Chat room!");
+        }
+        Err(e) => {
+            print_warning(use_colors, &format!("Could not send test message: {e}"));
+            println!("    Setup saved. Verify later with: ralph bot test");
+        }
+    }
+
+    println!();
+    if use_colors {
+        println!(
+            "\x1b[32mSetup complete!\x1b[0m Run `ralph run` to start with Rocket.Chat integration."
+        );
+    } else {
+        println!("Setup complete! Run `ralph run` to start with Rocket.Chat integration.");
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STATUS COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -348,6 +604,26 @@ async fn bot_status(use_colors: bool) -> Result<()> {
         println!("Ralph Bot Status");
         println!("================");
     }
+    println!();
+
+    let backend = detect_configured_backend();
+
+    match backend {
+        Backend::RocketChat => bot_status_rocketchat(use_colors).await,
+        Backend::Telegram => bot_status_telegram(use_colors).await,
+        Backend::None => {
+            print_error(use_colors, "No RObot backend configured");
+            println!();
+            println!("  Set up a backend with:");
+            println!("    ralph bot onboard --backend telegram");
+            println!("    ralph bot onboard --backend rocketchat");
+            Ok(())
+        }
+    }
+}
+
+async fn bot_status_telegram(use_colors: bool) -> Result<()> {
+    print_success(use_colors, "Backend: Telegram");
     println!();
 
     // Check keychain
@@ -440,11 +716,143 @@ async fn bot_status(use_colors: bool) -> Result<()> {
     Ok(())
 }
 
+async fn bot_status_rocketchat(use_colors: bool) -> Result<()> {
+    use ralph_rocketchat::client::{RocketChatApi, RocketChatClient};
+
+    print_success(use_colors, "Backend: Rocket.Chat");
+    println!();
+
+    // Load config
+    let config_path = Path::new("ralph.yml");
+    let config = RalphConfig::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    let rc = config
+        .robot
+        .rocketchat
+        .as_ref()
+        .context("RObot.rocketchat section missing from ralph.yml")?;
+
+    // Server URL
+    let server_url = config.robot.resolve_rocketchat_server_url();
+    if let Some(ref url) = server_url {
+        print_success(use_colors, &format!("Server URL: {}", url));
+    } else {
+        print_error(use_colors, "Server URL: not configured");
+    }
+
+    // Auth token
+    let auth_token = config.robot.resolve_rocketchat_auth_token();
+    if auth_token.is_some() {
+        print_success(use_colors, "Auth token: configured");
+    } else {
+        print_error(
+            use_colors,
+            "Auth token: not found (set RALPH_ROCKETCHAT_AUTH_TOKEN or config)",
+        );
+    }
+
+    // Bot user ID
+    if let Some(ref bot_user_id) = rc.bot_user_id {
+        print_success(use_colors, &format!("Bot user ID: {}", bot_user_id));
+    } else {
+        print_error(use_colors, "Bot user ID: not configured");
+    }
+
+    // Room ID
+    if let Some(ref room_id) = rc.room_id {
+        print_success(use_colors, &format!("Room ID: {}", room_id));
+    } else {
+        print_error(use_colors, "Room ID: not configured");
+    }
+
+    // Operator ID
+    if let Some(ref operator_id) = config.robot.operator_id {
+        print_success(use_colors, &format!("Operator ID: {}", operator_id));
+    } else {
+        print_status(
+            use_colors,
+            "Operator ID: not configured (all users can interact)",
+        );
+    }
+
+    // RObot enabled
+    if config.robot.enabled {
+        print_success(use_colors, "RObot: enabled");
+    } else {
+        print_status(use_colors, "RObot: not enabled");
+    }
+
+    // Validate credentials if we have enough info
+    println!();
+    if let (Some(url), Some(token), Some(bot_user_id)) =
+        (server_url, auth_token, rc.bot_user_id.clone())
+    {
+        print!("  Validating credentials with Rocket.Chat API...");
+        io::stdout().flush()?;
+        let client = RocketChatClient::new(url, token, &bot_user_id);
+        match client.get_me().await {
+            Ok(user) => {
+                println!();
+                let display_name = user.name.as_deref().unwrap_or(&user.username);
+                print_success(
+                    use_colors,
+                    &format!("Bot: {} (@{})", display_name, user.username),
+                );
+            }
+            Err(e) => {
+                println!();
+                print_error(use_colors, &format!("Credential validation failed: {e}"));
+            }
+        }
+
+        // Validate room if configured
+        if let Some(ref room_id) = rc.room_id {
+            match client.get_room_info(room_id).await {
+                Ok(room) => {
+                    let room_name = room.name.as_deref().unwrap_or("(DM)");
+                    print_success(
+                        use_colors,
+                        &format!("Room: {} (type: {})", room_name, room.t),
+                    );
+                }
+                Err(e) => {
+                    print_error(use_colors, &format!("Room validation failed: {e}"));
+                }
+            }
+        }
+    } else {
+        print_error(
+            use_colors,
+            "Cannot validate: missing server_url, auth_token, or bot_user_id",
+        );
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TEST COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn bot_test(args: TestArgs, use_colors: bool) -> Result<()> {
+    let backend = detect_configured_backend();
+
+    match backend {
+        Backend::RocketChat => bot_test_rocketchat(args, use_colors).await,
+        Backend::Telegram => bot_test_telegram(args, use_colors).await,
+        Backend::None => {
+            print_error(use_colors, "No RObot backend configured");
+            println!();
+            println!("  Set up a backend with:");
+            println!("    ralph bot onboard --backend telegram");
+            println!("    ralph bot onboard --backend rocketchat");
+            Ok(())
+        }
+    }
+}
+
+async fn bot_test_telegram(args: TestArgs, use_colors: bool) -> Result<()> {
     // Resolve token
     let token = resolve_token().context(
         "No bot token available. Run `ralph bot onboard` or set RALPH_TELEGRAM_BOT_TOKEN",
@@ -472,13 +880,67 @@ async fn bot_test(args: TestArgs, use_colors: bool) -> Result<()> {
     Ok(())
 }
 
+async fn bot_test_rocketchat(args: TestArgs, use_colors: bool) -> Result<()> {
+    use ralph_rocketchat::client::{RocketChatApi, RocketChatClient};
+
+    // Load config
+    let config_path = Path::new("ralph.yml");
+    let config = RalphConfig::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    let rc = config
+        .robot
+        .rocketchat
+        .as_ref()
+        .context("RObot.rocketchat section missing from ralph.yml")?;
+
+    // Resolve credentials
+    let server_url = config
+        .robot
+        .resolve_rocketchat_server_url()
+        .context("No server_url configured. Run `ralph bot onboard --backend rocketchat`")?;
+
+    let auth_token = config
+        .robot
+        .resolve_rocketchat_auth_token()
+        .context("No auth_token configured. Set RALPH_ROCKETCHAT_AUTH_TOKEN or run `ralph bot onboard --backend rocketchat`")?;
+
+    let bot_user_id = rc
+        .bot_user_id
+        .as_ref()
+        .context("No bot_user_id configured. Run `ralph bot onboard --backend rocketchat`")?;
+
+    let room_id = rc
+        .room_id
+        .as_ref()
+        .context("No room_id configured. Run `ralph bot onboard --backend rocketchat`")?;
+
+    print!("  Sending message to room {}...", room_id);
+    io::stdout().flush()?;
+
+    let client = RocketChatClient::new(server_url, auth_token, bot_user_id);
+    match client.send_message(room_id, &args.message, None).await {
+        Ok(_) => {
+            println!();
+            print_success(use_colors, "Message sent!");
+        }
+        Err(e) => {
+            println!();
+            print_error(use_colors, &format!("Failed to send message: {e}"));
+            anyhow::bail!("Send failed");
+        }
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DAEMON COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run the bot daemon — delegates to the configured communication adapter.
 ///
-/// Currently only Telegram is supported. The adapter implements
+/// Supports Telegram and Rocket.Chat backends. The adapter implements
 /// [`DaemonAdapter`] and handles all platform-specific concerns.
 async fn run_daemon(
     _args: DaemonArgs,
@@ -551,26 +1013,60 @@ async fn run_daemon(
         warn!("Using resolved runtime config: {}", config_path.display());
     }
 
-    // Resolve bot token and chat_id for Telegram adapter
-    let token = config.robot.resolve_bot_token().context(
-        "No bot token available. Run `ralph bot onboard` or set RALPH_TELEGRAM_BOT_TOKEN",
-    )?;
-    let chat_id =
-        resolve_chat_id().context("No chat_id found. Run `ralph bot onboard` to detect it")?;
+    // Detect which backend is configured and build the appropriate adapter
+    let adapter: Box<dyn DaemonAdapter> = if let Some(rc) = &config.robot.rocketchat {
+        let auth_token = config
+            .robot
+            .resolve_rocketchat_auth_token()
+            .context("No Rocket.Chat auth token available. Set RALPH_ROCKETCHAT_AUTH_TOKEN env var or set RObot.rocketchat.auth_token in config")?;
+        let server_url = config
+            .robot
+            .resolve_rocketchat_server_url()
+            .context("No Rocket.Chat server URL available. Set RALPH_ROCKETCHAT_SERVER_URL env var or set RObot.rocketchat.server_url in config")?;
+        let bot_user_id = rc
+            .bot_user_id
+            .clone()
+            .context("RObot.rocketchat.bot_user_id is required")?;
+        let room_id = rc
+            .room_id
+            .clone()
+            .context("RObot.rocketchat.room_id is required")?;
+        let operator_id = config.robot.operator_id.clone();
 
-    if use_colors {
-        println!("\x1b[1mRalph Daemon\x1b[0m (Telegram)");
+        if use_colors {
+            println!("\x1b[1mRalph Daemon\x1b[0m (Rocket.Chat)");
+        } else {
+            println!("Ralph Daemon (Rocket.Chat)");
+        }
+
+        Box::new(ralph_rocketchat::daemon::RocketChatDaemon::new(
+            server_url,
+            auth_token,
+            bot_user_id,
+            room_id,
+            operator_id,
+        ))
     } else {
-        println!("Ralph Daemon (Telegram)");
-    }
+        // Telegram backend (default)
+        let token = config.robot.resolve_bot_token().context(
+            "No bot token available. Run `ralph bot onboard` or set RALPH_TELEGRAM_BOT_TOKEN",
+        )?;
+        let chat_id =
+            resolve_chat_id().context("No chat_id found. Run `ralph bot onboard` to detect it")?;
 
-    // Resolve custom API URL (env var > config file)
-    let api_url = std::env::var("RALPH_TELEGRAM_API_URL")
-        .ok()
-        .or_else(|| load_config_api_url_from(&config_path));
+        if use_colors {
+            println!("\x1b[1mRalph Daemon\x1b[0m (Telegram)");
+        } else {
+            println!("Ralph Daemon (Telegram)");
+        }
 
-    // Build the adapter
-    let adapter = ralph_telegram::TelegramDaemon::new(token, api_url, chat_id);
+        // Resolve custom API URL (env var > config file)
+        let api_url = std::env::var("RALPH_TELEGRAM_API_URL")
+            .ok()
+            .or_else(|| load_config_api_url_from(&config_path));
+
+        Box::new(ralph_telegram::TelegramDaemon::new(token, api_url, chat_id))
+    };
 
     // Build the start_loop callback — wraps our CLI loop runner
     let start_loop: ralph_proto::StartLoopFn = Box::new(move |prompt: String| {
@@ -787,6 +1283,25 @@ fn load_bot_token() -> Option<String> {
         .and_then(|e| e.get_password().ok())
 }
 
+/// Store Rocket.Chat auth token in OS keychain.
+fn store_rocketchat_auth_token(token: &str) -> Result<()> {
+    let entry = keyring::Entry::new("ralph", "rocketchat-auth-token")
+        .context("Failed to create keychain entry")?;
+    if let Err(err) = entry.set_password(token) {
+        if entry.delete_credential().is_ok() {
+            entry
+                .set_password(token)
+                .context("Failed to store token in keychain after deleting existing entry")?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "Failed to store token in keychain: {}",
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -847,6 +1362,85 @@ fn save_robot_config(timeout: u64, bot_token: Option<&str>) -> Result<()> {
             format!("RObot:\n  enabled: true\n  timeout_seconds: {}\n", timeout)
         };
         std::fs::write(config_path, yaml).context("Failed to create ralph.yml")?;
+    }
+
+    Ok(())
+}
+
+/// Save Rocket.Chat RObot config to ralph.yml.
+///
+/// If ralph.yml exists, parses it and updates the RObot section with rocketchat sub-key.
+/// If it doesn't exist, creates a minimal config.
+fn save_rocketchat_config(
+    server_url: &str,
+    bot_user_id: &str,
+    room_id: &str,
+    operator_id: Option<&str>,
+) -> Result<()> {
+    let config_path = Path::new("ralph.yml");
+
+    let mut rc_map = serde_yaml::Mapping::new();
+    rc_map.insert(
+        serde_yaml::Value::String("server_url".to_string()),
+        serde_yaml::Value::String(server_url.to_string()),
+    );
+    rc_map.insert(
+        serde_yaml::Value::String("bot_user_id".to_string()),
+        serde_yaml::Value::String(bot_user_id.to_string()),
+    );
+    rc_map.insert(
+        serde_yaml::Value::String("room_id".to_string()),
+        serde_yaml::Value::String(room_id.to_string()),
+    );
+
+    let mut robot_map = serde_yaml::Mapping::new();
+    robot_map.insert(
+        serde_yaml::Value::String("enabled".to_string()),
+        serde_yaml::Value::Bool(true),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("timeout_seconds".to_string()),
+        serde_yaml::Value::Number(serde_yaml::Number::from(300u64)),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("rocketchat".to_string()),
+        serde_yaml::Value::Mapping(rc_map),
+    );
+    if let Some(oid) = operator_id {
+        robot_map.insert(
+            serde_yaml::Value::String("operator_id".to_string()),
+            serde_yaml::Value::String(oid.to_string()),
+        );
+    }
+
+    let robot = serde_yaml::Value::Mapping(robot_map);
+
+    if config_path.exists() {
+        let content = std::fs::read_to_string(config_path).context("Failed to read ralph.yml")?;
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&content).context("Failed to parse ralph.yml")?;
+
+        if let serde_yaml::Value::Mapping(ref mut map) = doc {
+            map.insert(serde_yaml::Value::String("RObot".to_string()), robot);
+        }
+
+        let yaml_str = serde_yaml::to_string(&doc).context("Failed to serialize config")?;
+        std::fs::write(config_path, yaml_str).context("Failed to write ralph.yml")?;
+    } else {
+        let mut lines = vec![
+            "RObot:".to_string(),
+            "  enabled: true".to_string(),
+            "  timeout_seconds: 300".to_string(),
+            "  rocketchat:".to_string(),
+            format!("    server_url: {}", server_url),
+            format!("    bot_user_id: {}", bot_user_id),
+            format!("    room_id: {}", room_id),
+        ];
+        if let Some(oid) = operator_id {
+            lines.push(format!("  operator_id: {}", oid));
+        }
+        lines.push(String::new()); // trailing newline
+        std::fs::write(config_path, lines.join("\n")).context("Failed to create ralph.yml")?;
     }
 
     Ok(())
@@ -975,6 +1569,51 @@ fn load_config_api_url_from(path: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Detected RObot backend from config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Telegram,
+    RocketChat,
+    None,
+}
+
+/// Detect which RObot backend is configured in `ralph.yml`.
+///
+/// Checks the `RObot` (or `robot`) section for `telegram` and `rocketchat`
+/// sub-keys. Returns [`Backend::None`] if neither is present or the config
+/// file cannot be read.
+pub(crate) fn detect_configured_backend() -> Backend {
+    detect_configured_backend_from(Path::new("ralph.yml"))
+}
+
+/// Testable version that accepts an arbitrary config path.
+fn detect_configured_backend_from(path: &Path) -> Backend {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Backend::None,
+    };
+    let config: serde_yaml::Value = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return Backend::None,
+    };
+
+    let robot = config.get("RObot").or_else(|| config.get("robot"));
+
+    let robot = match robot {
+        Some(r) => r,
+        None => return Backend::None,
+    };
+
+    let has_rc = robot.get("rocketchat").is_some();
+    let has_tg = robot.get("telegram").is_some();
+
+    match (has_rc, has_tg) {
+        (true, _) => Backend::RocketChat,
+        (false, true) => Backend::Telegram,
+        _ => Backend::None,
+    }
+}
+
 /// Check if RObot is enabled in config.
 fn is_robot_enabled() -> bool {
     let content = match std::fs::read_to_string("ralph.yml") {
@@ -1049,6 +1688,35 @@ fn prompt_token() -> Result<String> {
         }
         return Ok(token);
     }
+}
+
+/// Prompt user for a required input value with retry on empty.
+fn prompt_input(prompt: &str) -> Result<String> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read input")?;
+        let value = input.trim().to_string();
+        if value.is_empty() {
+            println!("  Value cannot be empty. Please try again.");
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+/// Prompt user for an optional input value (empty string is allowed).
+fn prompt_input_optional(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read input")?;
+    Ok(input.trim().to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1597,5 +2265,231 @@ mod tests {
         let missing_path = temp_dir.path().join("missing.yml");
 
         assert_eq!(load_config_bot_token_from(&missing_path), None);
+    }
+
+    // ── detect_configured_backend tests ─────────────────────────────────
+
+    #[test]
+    fn test_detect_backend_telegram() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  enabled: true\n  telegram:\n    bot_token: tok\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::Telegram
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_rocketchat() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  enabled: true\n  rocketchat:\n    server_url: https://rc.example.com\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::RocketChat
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_none_when_no_backend_section() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&config_path, "RObot:\n  enabled: true\n").unwrap();
+
+        assert_eq!(detect_configured_backend_from(&config_path), Backend::None);
+    }
+
+    #[test]
+    fn test_detect_backend_none_when_no_robot_section() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&config_path, "cli:\n  backend: claude\n").unwrap();
+
+        assert_eq!(detect_configured_backend_from(&config_path), Backend::None);
+    }
+
+    #[test]
+    fn test_detect_backend_none_when_file_missing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("missing.yml");
+
+        assert_eq!(detect_configured_backend_from(&config_path), Backend::None);
+    }
+
+    #[test]
+    fn test_detect_backend_lowercase_robot_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&config_path, "robot:\n  telegram:\n    bot_token: tok\n").unwrap();
+
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::Telegram
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_rocketchat_wins_when_both_present() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  telegram:\n    bot_token: tok\n  rocketchat:\n    server_url: https://rc.example.com\n",
+        )
+        .unwrap();
+
+        // rocketchat takes priority (config validation rejects this, but detection is deterministic)
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::RocketChat
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_invalid_yaml_returns_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(&config_path, "not: [valid yaml").unwrap();
+
+        assert_eq!(detect_configured_backend_from(&config_path), Backend::None);
+    }
+
+    // ── onboard argument routing tests ─────────────────────────────────
+
+    fn parse_bot_args(args: &[&str]) -> BotArgs {
+        use clap::Parser;
+        BotArgs::try_parse_from(std::iter::once("bot").chain(args.iter().copied()))
+            .expect("failed to parse BotArgs")
+    }
+
+    #[test]
+    fn test_onboard_defaults_to_telegram_backend() {
+        let bot = parse_bot_args(&["onboard"]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "telegram");
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_backend_rocketchat() {
+        let bot = parse_bot_args(&["onboard", "--backend", "rocketchat"]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "rocketchat");
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_rocketchat_specific_flags() {
+        let bot = parse_bot_args(&[
+            "onboard",
+            "--backend",
+            "rocketchat",
+            "--server-url",
+            "https://rc.example.com",
+            "--bot-user-id",
+            "bot123",
+            "--auth-token",
+            "secret-token",
+            "--room-id",
+            "GENERAL",
+            "--operator-id",
+            "user456",
+        ]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "rocketchat");
+                assert_eq!(args.server_url.as_deref(), Some("https://rc.example.com"));
+                assert_eq!(args.bot_user_id.as_deref(), Some("bot123"));
+                assert_eq!(args.auth_token.as_deref(), Some("secret-token"));
+                assert_eq!(args.room_id.as_deref(), Some("GENERAL"));
+                assert_eq!(args.operator_id.as_deref(), Some("user456"));
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_telegram_specific_flags() {
+        let bot = parse_bot_args(&[
+            "onboard",
+            "--backend",
+            "telegram",
+            "--token",
+            "123:ABC",
+            "--chat-id",
+            "987654",
+            "--timeout",
+            "60",
+        ]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "telegram");
+                assert_eq!(args.token.as_deref(), Some("123:ABC"));
+                assert_eq!(args.chat_id, Some(987_654));
+                assert_eq!(args.timeout, 60);
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_rc_flags_default_to_none() {
+        let bot = parse_bot_args(&["onboard", "--backend", "rocketchat"]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "rocketchat");
+                assert!(args.server_url.is_none());
+                assert!(args.bot_user_id.is_none());
+                assert!(args.auth_token.is_none());
+                assert!(args.room_id.is_none());
+                assert!(args.operator_id.is_none());
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_onboard_unknown_backend_errors() {
+        let args = BotArgs {
+            command: BotCommands::Onboard(OnboardArgs {
+                backend: "slack".to_string(),
+                token: None,
+                chat_id: None,
+                timeout: 120,
+                server_url: None,
+                bot_user_id: None,
+                auth_token: None,
+                room_id: None,
+                operator_id: None,
+            }),
+        };
+        let err = execute(args, &[], None, false)
+            .await
+            .expect_err("expected error for unknown backend");
+        assert!(
+            err.to_string().contains("Unknown backend"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("slack"),
+            "error should mention the bad backend: {err}"
+        );
     }
 }

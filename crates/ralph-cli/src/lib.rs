@@ -1,12 +1,28 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod colors {
     pub const DIM: &str = "\x1b[2m";
     pub const RESET: &str = "\x1b[0m";
     pub const CYAN: &str = "\x1b[36m";
     pub const GREEN: &str = "\x1b[32m";
+}
+
+/// Traverses up from CWD looking for a `.ralph/` directory.
+///
+/// Similar to how git traverses up looking for `.git/`, this handles the case
+/// where an agent has `cd`'d into a subdirectory during its work.
+pub fn find_ralph_root_by_traversal() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".ralph").is_dir() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 /// Clean diagnostic logs from .ralph/diagnostics directory

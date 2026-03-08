@@ -162,6 +162,55 @@ fn test_task_ready_all_shows_tasks_from_all_loops() {
 }
 
 #[test]
+fn test_task_add_from_subdirectory_without_root() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let temp_path = temp_dir.path();
+
+    // Create .ralph directory at project root (needed for traversal)
+    let ralph_dir = temp_path.join(".ralph");
+    std::fs::create_dir_all(&ralph_dir).expect("create .ralph");
+
+    // Create a subdirectory to simulate agent cd'ing into it
+    let sub_dir = temp_path.join("src").join("deep").join("nested");
+    std::fs::create_dir_all(&sub_dir).expect("create subdirectory");
+
+    // Run ralph tools task add from the subdirectory WITHOUT --root
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("tools")
+        .arg("task")
+        .args(["add", "Task from subdirectory", "--format", "quiet"])
+        .current_dir(&sub_dir)
+        .output()
+        .expect("Failed to execute ralph tools task command");
+
+    assert!(
+        output.status.success(),
+        "task add from subdirectory should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Task should be written to the project root's .ralph/agent/tasks.jsonl,
+    // NOT to src/deep/nested/.ralph/agent/tasks.jsonl
+    let correct_path = temp_path.join(".ralph/agent/tasks.jsonl");
+    let wrong_path = sub_dir.join(".ralph/agent/tasks.jsonl");
+
+    assert!(
+        correct_path.exists(),
+        "tasks.jsonl should exist at project root"
+    );
+    assert!(
+        !wrong_path.exists(),
+        "tasks.jsonl should NOT be created in subdirectory"
+    );
+
+    // Verify the task is readable with --root
+    let stdout = ralph_task_ok(temp_path, &["list", "--format", "json", "--all"]);
+    let tasks: Vec<Task> = serde_json::from_str(&stdout).expect("parse tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].title, "Task from subdirectory");
+}
+
+#[test]
 fn test_task_show_json() {
     let temp_dir = TempDir::new().expect("temp dir");
     let temp_path = temp_dir.path();

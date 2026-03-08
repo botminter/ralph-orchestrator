@@ -2812,6 +2812,7 @@ dependencies = [
  "ralph-api",
  "ralph-core",
  "ralph-proto",
+ "ralph-rocketchat",
  "ralph-telegram",
  "ralph-tui",
  "ratatui",
@@ -2882,6 +2883,26 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "ralph-rocketchat"
+version = "2.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "nix 0.29.0",
+ "ralph-proto",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

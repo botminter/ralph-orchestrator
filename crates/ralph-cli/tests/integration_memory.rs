@@ -678,6 +678,59 @@ fn test_memory_prime_empty() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Subdirectory Traversal Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_memory_add_from_subdirectory_without_root() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let temp_path = temp_dir.path();
+
+    // Create .ralph directory at project root (needed for traversal)
+    fs::create_dir_all(temp_path.join(".ralph"))?;
+
+    // Create a subdirectory to simulate agent cd'ing into it
+    let sub_dir = temp_path.join("src").join("deep").join("nested");
+    fs::create_dir_all(&sub_dir)?;
+
+    // Run ralph tools memory add from the subdirectory WITHOUT --root
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("tools")
+        .arg("memory")
+        .args(["add", "Memory from subdirectory", "--format", "quiet"])
+        .current_dir(&sub_dir)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "memory add from subdirectory should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Memory should be written to the project root's .ralph/agent/memories.md,
+    // NOT to src/deep/nested/.ralph/agent/memories.md
+    let correct_path = temp_path.join(".ralph/agent/memories.md");
+    let wrong_path = sub_dir.join(".ralph/agent/memories.md");
+
+    assert!(
+        correct_path.exists(),
+        "memories.md should exist at project root"
+    );
+    assert!(
+        !wrong_path.exists(),
+        "memories.md should NOT be created in subdirectory"
+    );
+
+    // Verify the memory is readable with --root
+    let stdout = ralph_memory_ok(temp_path, &["list", "--format", "json"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["content"], "Memory from subdirectory");
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Color Output Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

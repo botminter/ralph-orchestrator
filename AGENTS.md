@@ -31,17 +31,18 @@ npm run test:server                          # Backend tests
 ## Architecture
 
 ```
-ralph-cli      → CLI entry point, commands (run, plan, task, loops, web)
-ralph-core     → Orchestration logic, event loop, hats, memories, tasks
-ralph-adapters → Backend integrations (Claude, Kiro, Gemini, Codex, Roo, etc.)
-ralph-telegram → Telegram bot for human-in-the-loop communication
-ralph-tui      → Terminal UI (ratatui-based)
-ralph-e2e      → End-to-end test framework
-ralph-proto    → Protocol definitions
-ralph-bench    → Benchmarking
+ralph-cli        → CLI entry point, commands (run, plan, task, loops, web)
+ralph-core       → Orchestration logic, event loop, hats, memories, tasks
+ralph-adapters   → Backend integrations (Claude, Kiro, Gemini, Codex, Roo, etc.)
+ralph-telegram   → Telegram bot for human-in-the-loop communication
+ralph-rocketchat → Rocket.Chat bot for human-in-the-loop communication
+ralph-tui        → Terminal UI (ratatui-based)
+ralph-e2e        → End-to-end test framework
+ralph-proto      → Protocol definitions
+ralph-bench      → Benchmarking
 
-backend/       → Web server (@ralph-web/server) - Fastify + tRPC + SQLite
-frontend/      → Web dashboard (@ralph-web/dashboard) - React + Vite + TailwindCSS
+backend/         → Web server (@ralph-web/server) - Fastify + tRPC + SQLite
+frontend/        → Web dashboard (@ralph-web/dashboard) - React + Vite + TailwindCSS
 ```
 
 ### Key Files
@@ -54,6 +55,7 @@ frontend/      → Web dashboard (@ralph-web/dashboard) - React + Vite + Tailwin
 | `.ralph/loops.json` | Registry of all tracked loops |
 | `.ralph/merge-queue.jsonl` | Event-sourced merge queue |
 | `.ralph/telegram-state.json` | Telegram bot state (chat ID, pending questions) |
+| `.ralph/rocketchat-state.json` | Rocket.Chat bot state (last synced timestamp, pending questions) |
 
 ### Code Locations
 
@@ -66,7 +68,8 @@ frontend/      → Web dashboard (@ralph-web/dashboard) - React + Vite + Tailwin
 - **Merge queue**: `crates/ralph-core/src/merge_queue.rs`
 - **CLI commands**: `crates/ralph-cli/src/loops.rs`, `task_cli.rs`
 - **Telegram integration**: `crates/ralph-telegram/src/` (bot, service, state, handler)
-- **RObot config**: `crates/ralph-core/src/config.rs` (`RobotConfig`, `TelegramBotConfig`)
+- **Rocket.Chat integration**: `crates/ralph-rocketchat/src/` (client, service, daemon, handler, state, commands)
+- **RObot config**: `crates/ralph-core/src/config.rs` (`RobotConfig`, `TelegramBotConfig`, `RocketChatConfig`)
 - **Web server**: `backend/ralph-web-server/src/` (tRPC routes in `api/`, runners in `runner/`)
 - **Web dashboard**: `frontend/ralph-web/src/` (React components in `components/`)
 
@@ -177,17 +180,31 @@ Reports generated in `.e2e-tests/`.
 
 ## RObot (Human-in-the-Loop)
 
-Ralph supports human interaction during orchestration via Telegram. Agents can ask questions and humans can send proactive guidance.
+Ralph supports human interaction during orchestration via Telegram or Rocket.Chat. Agents can ask questions and humans can send proactive guidance. Configure exactly one backend — both cannot be active simultaneously.
 
 ### Configuration
 
 ```yaml
-# ralph.yml
+# ralph.yml — Telegram backend
 RObot:
   enabled: true
-  timeout_seconds: 300    # How long to block waiting for a response
+  timeout_seconds: 300
+  operator_id: "your-user-id"  # Filter messages to this operator (optional, for group chats)
   telegram:
-    bot_token: "your-token"  # Or set RALPH_TELEGRAM_BOT_TOKEN env var
+    bot_token: "your-token"    # Or set RALPH_TELEGRAM_BOT_TOKEN env var
+```
+
+```yaml
+# ralph.yml — Rocket.Chat backend
+RObot:
+  enabled: true
+  timeout_seconds: 300
+  operator_id: "your-rc-user-id"  # Filter messages to this operator (optional, for group chats)
+  rocketchat:
+    server_url: "https://chat.example.com"  # Or set RALPH_ROCKETCHAT_SERVER_URL env var
+    bot_user_id: "bot-user-id"
+    auth_token: "bot-pat-token"             # Or set RALPH_ROCKETCHAT_AUTH_TOKEN env var
+    room_id: "room-id"
 ```
 
 ### Event Types
@@ -197,18 +214,19 @@ RObot:
 | `human.interact` | Agent to Human | Agent asks a question; loop blocks until response or timeout |
 | `human.response` | Human to Agent | Reply to a `human.interact` question |
 | `human.guidance` | Human to Agent | Proactive guidance injected as `## ROBOT GUIDANCE` in prompt |
-| `ralph tools interact progress` | Agent to Human | Non-blocking progress notification via Telegram (no event, direct send) |
+| `ralph tools interact progress` | Agent to Human | Non-blocking progress notification via configured backend (no event, direct send) |
 
 ### How It Works
 
-- The Telegram bot starts only on the **primary loop** (the one holding `.ralph/loop.lock`)
-- When an agent emits `human.interact`, the event loop sends the question via Telegram and **blocks**
+- The RObot backend starts only on the **primary loop** (the one holding `.ralph/loop.lock`)
+- When an agent emits `human.interact`, the event loop sends the question via the configured backend and **blocks**
 - Responses are published as `human.response` events on the bus
 - Proactive messages become `human.guidance` events, squashed into a numbered list in the prompt
 - Send failures retry with exponential backoff (3 attempts); if all fail, treated as timeout
-- Parallel loops route messages via reply-to, `@loop-id` prefix, or default to primary
+- Parallel loops route messages via reply-to (Telegram) or thread `tmid` (Rocket.Chat), `@loop-id` prefix, or default to primary
+- `operator_id` filters messages in group chats to only process the designated human operator
 
-See `crates/ralph-telegram/README.md` for setup instructions.
+See `crates/ralph-telegram/README.md` or `crates/ralph-rocketchat/README.md` for setup instructions.
 
 ## Diagnostics
 

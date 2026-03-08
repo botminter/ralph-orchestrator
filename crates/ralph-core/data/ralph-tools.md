@@ -60,7 +60,7 @@ ralph tools memory search "area-name"   # If you're entering an unfamiliar area
 ralph tools interact progress "message"
 ```
 
-Send a non-blocking progress update via the configured RObot (Telegram).
+Send a non-blocking progress update via the configured RObot backend (Telegram, Rocket.Chat, or Matrix).
 
 ## Skill Commands
 
@@ -74,12 +74,12 @@ List available skills or load a specific skill by name.
 ## Memory Commands
 
 ```bash
-ralph tools memory add "content" -t pattern --tags tag1,tag2
-ralph tools memory list [-t type] [--tags tags]
-ralph tools memory search "query" [-t type] [--tags tags]
-ralph tools memory prime --budget 2000    # Output for context injection
-ralph tools memory show <mem-id>
-ralph tools memory delete <mem-id>
+ralph tools memory --root {{RALPH_ROOT}} add "content" -t pattern --tags tag1,tag2
+ralph tools memory --root {{RALPH_ROOT}} list [-t type] [--tags tags]
+ralph tools memory --root {{RALPH_ROOT}} search "query" [-t type] [--tags tags]
+ralph tools memory --root {{RALPH_ROOT}} prime --budget 2000    # Output for context injection
+ralph tools memory --root {{RALPH_ROOT}} show <mem-id>
+ralph tools memory --root {{RALPH_ROOT}} delete <mem-id>
 ```
 
 **Memory types:**
@@ -129,7 +129,7 @@ If any command fails (non-zero exit), or you hit a missing dependency/skill, or 
 2. **Open or reopen a task** if it won't be resolved in the same iteration.
 
 ```bash
-ralph tools memory add \
+ralph tools memory --root {{RALPH_ROOT}} add \
   "failure: cmd=<command>, exit=<code>, error=<message>, next=<intended fix>" \
   -t fix --tags tooling,error-handling
 
@@ -141,7 +141,7 @@ ralph tools task ensure "Fix: <short description>" --key fix:<short-key> -p 2
 Before searching or adding, check what tags already exist:
 
 ```bash
-ralph tools memory list
+ralph tools memory --root {{RALPH_ROOT}} list
 grep -o 'tags: [^|]*' .agent/memories.md | sort -u
 ```
 
@@ -198,26 +198,26 @@ ralph tools task ready  # Only shows unblocked tasks
 
 ### Store a discovery
 ```bash
-ralph tools memory add "Parser requires snake_case keys" -t pattern --tags config,yaml
+ralph tools memory --root {{RALPH_ROOT}} add "Parser requires snake_case keys" -t pattern --tags config,yaml
 ```
 
 ### Find relevant memories
 ```bash
-ralph tools memory search "config" --tags yaml
-ralph tools memory prime --budget 1000 -t pattern  # For injection
+ralph tools memory --root {{RALPH_ROOT}} search "config" --tags yaml
+ralph tools memory --root {{RALPH_ROOT}} prime --budget 1000 -t pattern  # For injection
 ```
 
 ### Memory examples
 ```bash
 # Pattern: discovered codebase convention
-ralph tools memory add "All API handlers return Result<Json<T>, AppError>" -t pattern --tags api,error-handling
+ralph tools memory --root {{RALPH_ROOT}} add "All API handlers return Result<Json<T>, AppError>" -t pattern --tags api,error-handling
 
 # Decision: learned why something was chosen
-ralph tools memory add "Chose JSONL over SQLite: simpler, git-friendly, append-only" -t decision --tags storage,architecture
+ralph tools memory --root {{RALPH_ROOT}} add "Chose JSONL over SQLite: simpler, git-friendly, append-only" -t decision --tags storage,architecture
 
 # Fix: solved a recurring problem
-ralph tools memory add "cargo test hangs: kill orphan postgres from previous run" -t fix --tags testing,postgres
+ralph tools memory --root {{RALPH_ROOT}} add "cargo test hangs: kill orphan postgres from previous run" -t fix --tags testing,postgres
 
 # Context: project-specific knowledge
-ralph tools memory add "The /legacy folder is deprecated, use /v2 endpoints" -t context --tags api,migration
+ralph tools memory --root {{RALPH_ROOT}} add "The /legacy folder is deprecated, use /v2 endpoints" -t context --tags api,migration
 ```

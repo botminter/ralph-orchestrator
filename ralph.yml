@@ -3,41 +3,41 @@ event_loop:
   max_iterations: 150
   max_runtime_seconds: 28800
   starting_event: work.start
-
 cli:
-  backend: pi
-
+  backend: claude
 core:
   specs_dir: ./specs/
   guardrails:
-    - "Fresh context each iteration — re-read scratchpad and plan."
-    - "Commit after each completed step. Never commit Ralph files."
-    - "Verification is mandatory — `just ci` must pass (fmt, clippy, tests). See AGENTS.md."
-    - "Acceptance tests must be real — no placeholder/pending/stub acceptance scenarios when emitting LOOP_COMPLETE."
-    - "BDD acceptance checks must verify runtime behavior; comment-only or `Ok(())`-only evaluator passes are invalid."
-    - "Confidence protocol: >80 proceed; 50-80 proceed + note in scratchpad; <50 choose safe default + note."
-    - "Preserve primary sources — capture referenced code snippets with file:line attribution in scratchpad."
-    - "Run targeted tests per crate (`cargo test -p ralph-core`) during subtasks; full `cargo test --all` only at final step."
-
+  - Fresh context each iteration — re-read scratchpad and plan.
+  - Commit after each completed step. Never commit Ralph files.
+  - Verification is mandatory — `just ci` must pass (fmt, clippy, tests). See AGENTS.md.
+  - Acceptance tests must be real — no placeholder/pending/stub acceptance scenarios when emitting LOOP_COMPLETE.
+  - BDD acceptance checks must verify runtime behavior; comment-only or `Ok(())`-only evaluator passes are invalid.
+  - 'Confidence protocol: >80 proceed; 50-80 proceed + note in scratchpad; <50 choose safe default + note.'
+  - Preserve primary sources — capture referenced code snippets with file:line attribution in scratchpad.
+  - Run targeted tests per crate (`cargo test -p ralph-core`) during subtasks; full `cargo test --all` only at final step.
 backpressure:
   gates:
-    - name: fmt
-      command: cargo fmt --all -- --check
-      on_fail: "Formatting failed. Run `cargo fmt --all` and retry."
-    - name: clippy
-      command: cargo clippy --all-targets --all-features -- -D warnings
-      on_fail: "Clippy lint failures. Fix all warnings before proceeding."
-    - name: test
-      command: cargo test --all
-      on_fail: "Tests failed. Fix failing tests before proceeding."
-
+  - name: fmt
+    command: cargo fmt --all -- --check
+    on_fail: Formatting failed. Run `cargo fmt --all` and retry.
+  - name: clippy
+    command: cargo clippy --all-targets --all-features -- -D warnings
+    on_fail: Clippy lint failures. Fix all warnings before proceeding.
+  - name: test
+    command: cargo test --all
+    on_fail: Tests failed. Fix failing tests before proceeding.
 hats:
   planner:
-    name: "📋 Planner"
-    description: "Breaks steps into sub-tasks scoped to individual crates"
-    triggers: ["work.start", "subtask.done"]
-    publishes: ["subtask.ready", "all_steps.done"]
-    default_publishes: "subtask.ready"
+    name: 📋 Planner
+    description: Breaks steps into sub-tasks scoped to individual crates
+    triggers:
+    - work.start
+    - subtask.done
+    publishes:
+    - subtask.ready
+    - all_steps.done
+    default_publishes: subtask.ready
     instructions: |
       Manage sub-task breakdown and assignment for this Rust workspace.
 
@@ -108,13 +108,16 @@ hats:
       ## Completed Steps:
       - Step 0: (if any)
       ```
-
   builder:
-    name: "⚡ Builder"
-    description: "Implements one sub-task at a time within the Rust workspace"
-    triggers: ["subtask.ready", "review.changes_requested"]
-    publishes: ["subtask.done", "implementation.done"]
-    default_publishes: "subtask.done"
+    name: ⚡ Builder
+    description: Implements one sub-task at a time within the Rust workspace
+    triggers:
+    - subtask.ready
+    - review.changes_requested
+    publishes:
+    - subtask.done
+    - implementation.done
+    default_publishes: subtask.done
     instructions: |
       Implement the assigned sub-task only.
 
@@ -144,13 +147,16 @@ hats:
       4. Emit subtask.done
 
       On review.changes_requested → address feedback, emit implementation.done
-
   reviewer:
-    name: "👀 Reviewer"
-    description: "Reviews implementation quality against AGENTS.md conventions"
-    triggers: ["all_steps.done", "implementation.done"]
-    publishes: ["review.approved", "review.changes_requested"]
-    default_publishes: "review.approved"
+    name: 👀 Reviewer
+    description: Reviews implementation quality against AGENTS.md conventions
+    triggers:
+    - all_steps.done
+    - implementation.done
+    publishes:
+    - review.approved
+    - review.changes_requested
+    default_publishes: review.approved
     instructions: |
       Review implementation changes for this Rust workspace.
 
@@ -194,12 +200,13 @@ hats:
 
       If blocking → emit review.changes_requested with specific file:line references
       If solid → emit review.approved
-
   finalizer:
-    name: "📝 Finalizer"
-    description: "Documents changes and completes loop"
-    triggers: ["review.approved"]
-    publishes: ["LOOP_COMPLETE"]
+    name: 📝 Finalizer
+    description: Documents changes and completes loop
+    triggers:
+    - review.approved
+    publishes:
+    - LOOP_COMPLETE
     instructions: |
       Document the implementation and complete.
 
@@ -221,12 +228,16 @@ hats:
       Do NOT auto-apply.
 
       Output: LOOP_COMPLETE
-
 skills:
   enabled: true
   dirs:
     - .claude/skills
+  overrides:
+    ralph-operations:
+      auto_inject: true
 
 RObot:
-  enabled: false
+  enabled: true
   timeout_seconds: 120
+  telegram:
+    bot_token: 8377779532:AAHpxtdfwYfPc3UOg0hU3ZMkpqZ_gD6oXZM

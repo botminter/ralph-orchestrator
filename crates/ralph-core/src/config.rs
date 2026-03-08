@@ -1771,6 +1771,14 @@ pub struct RobotConfig {
     /// Telegram bot configuration.
     #[serde(default)]
     pub telegram: Option<TelegramBotConfig>,
+
+    /// Rocket.Chat bot configuration.
+    #[serde(default)]
+    pub rocketchat: Option<RocketChatConfig>,
+
+    /// Operator user ID for filtering messages in group chats.
+    /// When set, only messages from this user are processed.
+    pub operator_id: Option<String>,
 }
 
 impl RobotConfig {
@@ -1787,13 +1795,54 @@ impl RobotConfig {
             });
         }
 
-        // Bot token must be available from config, keychain, or env var
-        if self.resolve_bot_token().is_none() {
+        // Mutual exclusion: cannot configure both backends
+        if self.telegram.is_some() && self.rocketchat.is_some() {
+            return Err(ConfigError::MutuallyExclusive {
+                field1: "RObot.telegram".to_string(),
+                field2: "RObot.rocketchat".to_string(),
+            });
+        }
+
+        // Must configure at least one backend
+        if self.telegram.is_none() && self.rocketchat.is_none() {
+            return Err(ConfigError::RobotMissingField {
+                field: "RObot.backend".to_string(),
+                hint: "must configure telegram or rocketchat".to_string(),
+            });
+        }
+
+        // Telegram-specific validation
+        if self.telegram.is_some() && self.resolve_bot_token().is_none() {
             return Err(ConfigError::RobotMissingField {
                 field: "RObot.telegram.bot_token".to_string(),
                 hint: "Run `ralph bot onboard --telegram`, set RALPH_TELEGRAM_BOT_TOKEN env var, or set RObot.telegram.bot_token in config"
                     .to_string(),
             });
+        }
+
+        // Rocket.Chat-specific validation
+        if let Some(rc) = &self.rocketchat {
+            if self.resolve_rocketchat_auth_token().is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.rocketchat.auth_token".to_string(),
+                    hint: "Set RALPH_ROCKETCHAT_AUTH_TOKEN env var or set RObot.rocketchat.auth_token in config"
+                        .to_string(),
+                });
+            }
+            if self.resolve_rocketchat_server_url().is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.rocketchat.server_url".to_string(),
+                    hint: "Set RALPH_ROCKETCHAT_SERVER_URL env var or set RObot.rocketchat.server_url in config"
+                        .to_string(),
+                });
+            }
+            if rc.bot_user_id.is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.rocketchat.bot_user_id".to_string(),
+                    hint: "Set RObot.rocketchat.bot_user_id to the bot's Rocket.Chat user ID"
+                        .to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -1844,6 +1893,54 @@ impl RobotConfig {
                 .and_then(|telegram| telegram.api_url.clone())
         })
     }
+
+    /// Resolves the Rocket.Chat auth token from multiple sources.
+    ///
+    /// Resolution order (highest to lowest priority):
+    /// 1. `RALPH_ROCKETCHAT_AUTH_TOKEN` environment variable
+    /// 2. `RObot.rocketchat.auth_token` in config file
+    /// 3. OS keychain (service: "ralph", user: "rocketchat-auth-token")
+    pub fn resolve_rocketchat_auth_token(&self) -> Option<String> {
+        // 1. Env var (highest priority)
+        let env_token = std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").ok();
+        let config_token = self
+            .rocketchat
+            .as_ref()
+            .and_then(|rc| rc.auth_token.clone());
+
+        if cfg!(test) {
+            return env_token.or(config_token);
+        }
+
+        env_token
+            // 2. Config file (explicit override)
+            .or(config_token)
+            // 3. OS keychain (best effort)
+            .or_else(|| {
+                std::panic::catch_unwind(|| {
+                    keyring::Entry::new("ralph", "rocketchat-auth-token")
+                        .ok()
+                        .and_then(|e| e.get_password().ok())
+                })
+                .ok()
+                .flatten()
+            })
+    }
+
+    /// Resolves the Rocket.Chat server URL from multiple sources.
+    ///
+    /// Resolution order (highest to lowest priority):
+    /// 1. `RALPH_ROCKETCHAT_SERVER_URL` environment variable
+    /// 2. `RObot.rocketchat.server_url` in config file
+    pub fn resolve_rocketchat_server_url(&self) -> Option<String> {
+        std::env::var("RALPH_ROCKETCHAT_SERVER_URL")
+            .ok()
+            .or_else(|| {
+                self.rocketchat
+                    .as_ref()
+                    .and_then(|rc| rc.server_url.clone())
+            })
+    }
 }
 
 /// Telegram bot configuration.
@@ -1857,6 +1954,25 @@ pub struct TelegramBotConfig {
     /// Useful for targeting a local mock server (e.g., `telegram-test-api`)
     /// in CI/CD. Can also be set via `RALPH_TELEGRAM_API_URL` env var.
     pub api_url: Option<String>,
+}
+
+/// Rocket.Chat bot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RocketChatConfig {
+    /// Rocket.Chat server URL (e.g., `https://chat.example.com`).
+    /// Can also be set via `RALPH_ROCKETCHAT_SERVER_URL` env var.
+    pub server_url: Option<String>,
+
+    /// The bot's own Rocket.Chat user ID, used for the `X-User-Id` header
+    /// in REST API calls.
+    pub bot_user_id: Option<String>,
+
+    /// Personal Access Token for authentication.
+    /// Can also be set via `RALPH_ROCKETCHAT_AUTH_TOKEN` env var.
+    pub auth_token: Option<String>,
+
+    /// Room ID where the bot operates.
+    pub room_id: Option<String>,
 }
 
 /// Configuration errors.
@@ -3268,6 +3384,8 @@ RObot:
             timeout_seconds: None,
             checkin_interval_seconds: None,
             telegram: None,
+            rocketchat: None,
+            operator_id: None,
         };
         let result = robot.validate();
         assert!(result.is_err());
@@ -3293,6 +3411,8 @@ RObot:
                 bot_token: Some("config-token".to_string()),
                 api_url: None,
             }),
+            rocketchat: None,
+            operator_id: None,
         };
 
         // When RALPH_TELEGRAM_BOT_TOKEN is not set, config token is returned
@@ -3311,6 +3431,8 @@ RObot:
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
+            rocketchat: None,
+            operator_id: None,
         };
 
         // Without env var AND without config token, resolve returns None
@@ -3332,31 +3454,30 @@ RObot:
                 bot_token: Some("test-token".to_string()),
                 api_url: None,
             }),
+            rocketchat: None,
+            operator_id: None,
         };
         assert!(robot.validate().is_ok());
     }
 
     #[test]
-    fn test_robot_config_validate_missing_telegram_section() {
-        // No telegram section at all and no env var → fails
-        // (Skip if env var happens to be set)
-        if std::env::var("RALPH_TELEGRAM_BOT_TOKEN").is_ok() {
-            return;
-        }
-
+    fn test_robot_config_validate_no_backend_configured() {
+        // No telegram or rocketchat section → fails with missing backend error
         let robot = RobotConfig {
             enabled: true,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
+            rocketchat: None,
+            operator_id: None,
         };
         let result = robot.validate();
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
             matches!(&err, ConfigError::RobotMissingField { field, .. }
-                if field == "RObot.telegram.bot_token"),
-            "Expected bot_token validation failure, got: {:?}",
+                if field == "RObot.backend"),
+            "Expected missing backend error, got: {:?}",
             err
         );
     }
@@ -3377,6 +3498,8 @@ RObot:
                 bot_token: None,
                 api_url: None,
             }),
+            rocketchat: None,
+            operator_id: None,
         };
         let result = robot.validate();
         assert!(result.is_err());

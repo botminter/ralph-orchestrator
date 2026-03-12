@@ -24,6 +24,7 @@ ralph-core.workspace = true
 ralph-adapters.workspace = true
 ralph-telegram.workspace = true
 ralph-rocketchat.workspace = true
+ralph-matrix.workspace = true
 ralph-tui.workspace = true
 ralph-api.workspace = true
 

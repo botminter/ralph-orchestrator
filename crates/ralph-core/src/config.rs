@@ -1776,6 +1776,10 @@ pub struct RobotConfig {
     #[serde(default)]
     pub rocketchat: Option<RocketChatConfig>,
 
+    /// Matrix bot configuration.
+    #[serde(default)]
+    pub matrix: Option<MatrixConfig>,
+
     /// Operator user ID for filtering messages in group chats.
     /// When set, only messages from this user are processed.
     pub operator_id: Option<String>,
@@ -1795,19 +1799,33 @@ impl RobotConfig {
             });
         }
 
-        // Mutual exclusion: cannot configure both backends
-        if self.telegram.is_some() && self.rocketchat.is_some() {
-            return Err(ConfigError::MutuallyExclusive {
-                field1: "RObot.telegram".to_string(),
-                field2: "RObot.rocketchat".to_string(),
+        // Mutual exclusion: only one backend allowed
+        let mut configured_backends = Vec::new();
+        if self.telegram.is_some() {
+            configured_backends.push("RObot.telegram");
+        }
+        if self.rocketchat.is_some() {
+            configured_backends.push("RObot.rocketchat");
+        }
+        if self.matrix.is_some() {
+            configured_backends.push("RObot.matrix");
+        }
+
+        if configured_backends.len() > 1 {
+            return Err(ConfigError::RobotMissingField {
+                field: "RObot.backend".to_string(),
+                hint: format!(
+                    "only one backend can be configured at a time, found: {}",
+                    configured_backends.join(", ")
+                ),
             });
         }
 
         // Must configure at least one backend
-        if self.telegram.is_none() && self.rocketchat.is_none() {
+        if configured_backends.is_empty() {
             return Err(ConfigError::RobotMissingField {
                 field: "RObot.backend".to_string(),
-                hint: "must configure telegram or rocketchat".to_string(),
+                hint: "must configure telegram, rocketchat, or matrix".to_string(),
             });
         }
 
@@ -1841,6 +1859,36 @@ impl RobotConfig {
                     field: "RObot.rocketchat.bot_user_id".to_string(),
                     hint: "Set RObot.rocketchat.bot_user_id to the bot's Rocket.Chat user ID"
                         .to_string(),
+                });
+            }
+        }
+
+        // Matrix-specific validation
+        if let Some(mx) = &self.matrix {
+            if self.resolve_matrix_access_token().is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.matrix.access_token".to_string(),
+                    hint: "Set RALPH_MATRIX_ACCESS_TOKEN env var or set RObot.matrix.access_token in config"
+                        .to_string(),
+                });
+            }
+            if self.resolve_matrix_homeserver_url().is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.matrix.homeserver_url".to_string(),
+                    hint: "Set RALPH_MATRIX_HOMESERVER_URL env var or set RObot.matrix.homeserver_url in config"
+                        .to_string(),
+                });
+            }
+            if mx.room_id.is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.matrix.room_id".to_string(),
+                    hint: "Set RObot.matrix.room_id to the Matrix room ID".to_string(),
+                });
+            }
+            if mx.bot_user_id.is_none() {
+                return Err(ConfigError::RobotMissingField {
+                    field: "RObot.matrix.bot_user_id".to_string(),
+                    hint: "Set RObot.matrix.bot_user_id to the bot's Matrix user ID".to_string(),
                 });
             }
         }
@@ -1941,6 +1989,47 @@ impl RobotConfig {
                     .and_then(|rc| rc.server_url.clone())
             })
     }
+
+    /// Resolves the Matrix access token from multiple sources.
+    ///
+    /// Resolution order (highest to lowest priority):
+    /// 1. `RALPH_MATRIX_ACCESS_TOKEN` environment variable
+    /// 2. `RObot.matrix.access_token` in config file
+    /// 3. OS keychain (service: "ralph", user: "matrix-access-token")
+    pub fn resolve_matrix_access_token(&self) -> Option<String> {
+        // 1. Env var (highest priority)
+        let env_token = std::env::var("RALPH_MATRIX_ACCESS_TOKEN").ok();
+        let config_token = self.matrix.as_ref().and_then(|m| m.access_token.clone());
+
+        if cfg!(test) {
+            return env_token.or(config_token);
+        }
+
+        env_token
+            // 2. Config file (explicit override)
+            .or(config_token)
+            // 3. OS keychain (best effort)
+            .or_else(|| {
+                std::panic::catch_unwind(|| {
+                    keyring::Entry::new("ralph", "matrix-access-token")
+                        .ok()
+                        .and_then(|e| e.get_password().ok())
+                })
+                .ok()
+                .flatten()
+            })
+    }
+
+    /// Resolves the Matrix homeserver URL from multiple sources.
+    ///
+    /// Resolution order (highest to lowest priority):
+    /// 1. `RALPH_MATRIX_HOMESERVER_URL` environment variable
+    /// 2. `RObot.matrix.homeserver_url` in config file
+    pub fn resolve_matrix_homeserver_url(&self) -> Option<String> {
+        std::env::var("RALPH_MATRIX_HOMESERVER_URL")
+            .ok()
+            .or_else(|| self.matrix.as_ref().and_then(|m| m.homeserver_url.clone()))
+    }
 }
 
 /// Telegram bot configuration.
@@ -1973,6 +2062,24 @@ pub struct RocketChatConfig {
 
     /// Room ID where the bot operates.
     pub room_id: Option<String>,
+}
+
+/// Matrix bot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixConfig {
+    /// Matrix homeserver URL (e.g., `https://matrix.example.com`).
+    /// Can also be set via `RALPH_MATRIX_HOMESERVER_URL` env var.
+    pub homeserver_url: Option<String>,
+
+    /// Access token for Matrix authentication.
+    /// Can also be set via `RALPH_MATRIX_ACCESS_TOKEN` env var.
+    pub access_token: Option<String>,
+
+    /// Room ID where the bot operates.
+    pub room_id: Option<String>,
+
+    /// The bot's own Matrix user ID, used for filtering own messages.
+    pub bot_user_id: Option<String>,
 }
 
 /// Configuration errors.
@@ -3385,6 +3492,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: None,
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3412,6 +3520,7 @@ RObot:
                 api_url: None,
             }),
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
 
@@ -3432,6 +3541,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: None,
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
 
@@ -3455,6 +3565,7 @@ RObot:
                 api_url: None,
             }),
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
         assert!(robot.validate().is_ok());
@@ -3469,6 +3580,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: None,
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3499,6 +3611,7 @@ RObot:
                 api_url: None,
             }),
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3514,7 +3627,7 @@ RObot:
 
     #[test]
     fn test_robot_config_validate_mutual_exclusion() {
-        // Both telegram and rocketchat configured → MutuallyExclusive error
+        // Both telegram and rocketchat configured → multiple backends error
         let robot = RobotConfig {
             enabled: true,
             timeout_seconds: Some(300),
@@ -3529,15 +3642,16 @@ RObot:
                 auth_token: Some("rc-token".to_string()),
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, ConfigError::MutuallyExclusive { field1, field2 }
-                if field1 == "RObot.telegram" && field2 == "RObot.rocketchat"),
-            "Expected MutuallyExclusive error, got: {:?}",
+            matches!(&err, ConfigError::RobotMissingField { field, hint }
+                if field == "RObot.backend" && hint.contains("RObot.telegram") && hint.contains("RObot.rocketchat")),
+            "Expected multiple backends error, got: {:?}",
             err
         );
     }
@@ -3560,6 +3674,7 @@ RObot:
                 auth_token: Some("rc-token".to_string()),
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
         assert!(robot.validate().is_ok());
@@ -3583,6 +3698,7 @@ RObot:
                 auth_token: None,
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3615,6 +3731,7 @@ RObot:
                 auth_token: Some("rc-token".to_string()),
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3647,6 +3764,7 @@ RObot:
                 auth_token: Some("rc-token".to_string()),
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
         let result = robot.validate();
@@ -3673,6 +3791,7 @@ RObot:
                 auth_token: Some("config-rc-token".to_string()),
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
 
@@ -3688,6 +3807,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: None,
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
 
@@ -3710,6 +3830,7 @@ RObot:
                 auth_token: None,
                 room_id: None,
             }),
+            matrix: None,
             operator_id: None,
         };
 
@@ -3727,6 +3848,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: None,
             rocketchat: None,
+            matrix: None,
             operator_id: None,
         };
 
@@ -3748,10 +3870,371 @@ RObot:
                 api_url: None,
             }),
             rocketchat: None,
+            matrix: None,
             operator_id: Some("user-42".to_string()),
         };
         assert!(robot.validate().is_ok());
         assert_eq!(robot.operator_id.as_deref(), Some("user-42"));
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_valid() {
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok() {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        assert!(robot.validate().is_ok());
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_missing_access_token() {
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok() {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: None,
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.matrix.access_token"),
+            "Expected access_token validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_missing_homeserver_url() {
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok()
+            || std::env::var("RALPH_MATRIX_HOMESERVER_URL").is_ok()
+        {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: None,
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.matrix.homeserver_url"),
+            "Expected homeserver_url validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_missing_room_id() {
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok()
+            || std::env::var("RALPH_MATRIX_HOMESERVER_URL").is_ok()
+        {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: None,
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.matrix.room_id"),
+            "Expected room_id validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_missing_bot_user_id() {
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok()
+            || std::env::var("RALPH_MATRIX_HOMESERVER_URL").is_ok()
+        {
+            return;
+        }
+
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: None,
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, .. }
+                if field == "RObot.matrix.bot_user_id"),
+            "Expected bot_user_id validation failure, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_telegram_mutual_exclusion() {
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: Some(TelegramBotConfig {
+                bot_token: Some("test-token".to_string()),
+                api_url: None,
+            }),
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, hint }
+                if field == "RObot.backend" && hint.contains("RObot.telegram") && hint.contains("RObot.matrix")),
+            "Expected multiple backends error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_rocketchat_mutual_exclusion() {
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, hint }
+                if field == "RObot.backend" && hint.contains("RObot.rocketchat") && hint.contains("RObot.matrix")),
+            "Expected multiple backends error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_robot_config_validate_matrix_all_three_mutual_exclusion() {
+        let robot = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: Some(TelegramBotConfig {
+                bot_token: Some("test-token".to_string()),
+                api_url: None,
+            }),
+            rocketchat: Some(RocketChatConfig {
+                server_url: Some("https://chat.example.com".to_string()),
+                bot_user_id: Some("bot123".to_string()),
+                auth_token: Some("rc-token".to_string()),
+                room_id: None,
+            }),
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: Some("mx-token".to_string()),
+                room_id: Some("!room:example.com".to_string()),
+                bot_user_id: Some("@bot:example.com".to_string()),
+            }),
+            operator_id: None,
+        };
+        let result = robot.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::RobotMissingField { field, hint }
+                if field == "RObot.backend"
+                    && hint.contains("RObot.telegram")
+                    && hint.contains("RObot.rocketchat")
+                    && hint.contains("RObot.matrix")),
+            "Expected all-three backends error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_matrix_config_yaml_parsing() {
+        let yaml = r#"
+RObot:
+  enabled: true
+  timeout_seconds: 300
+  matrix:
+    homeserver_url: "https://matrix.example.com"
+    access_token: "mx-token-123"
+    room_id: "!room:example.com"
+    bot_user_id: "@bot:example.com"
+"#;
+        let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.robot.enabled);
+        assert_eq!(config.robot.timeout_seconds, Some(300));
+        let matrix = config.robot.matrix.as_ref().unwrap();
+        assert_eq!(
+            matrix.homeserver_url.as_deref(),
+            Some("https://matrix.example.com")
+        );
+        assert_eq!(matrix.access_token.as_deref(), Some("mx-token-123"));
+        assert_eq!(matrix.room_id.as_deref(), Some("!room:example.com"));
+        assert_eq!(matrix.bot_user_id.as_deref(), Some("@bot:example.com"));
+        assert!(config.robot.telegram.is_none());
+        assert!(config.robot.rocketchat.is_none());
+    }
+
+    #[test]
+    fn test_robot_config_resolve_matrix_access_token_from_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: None,
+                access_token: Some("config-mx-token".to_string()),
+                room_id: None,
+                bot_user_id: None,
+            }),
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_matrix_access_token();
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn test_robot_config_resolve_matrix_access_token_none_without_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: None,
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_matrix_access_token();
+        if std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_err() {
+            assert!(resolved.is_none());
+        }
+    }
+
+    #[test]
+    fn test_robot_config_resolve_matrix_homeserver_url_from_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: Some(MatrixConfig {
+                homeserver_url: Some("https://matrix.example.com".to_string()),
+                access_token: None,
+                room_id: None,
+                bot_user_id: None,
+            }),
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_matrix_homeserver_url();
+        if std::env::var("RALPH_MATRIX_HOMESERVER_URL").is_err() {
+            assert_eq!(resolved.as_deref(), Some("https://matrix.example.com"));
+        }
+    }
+
+    #[test]
+    fn test_robot_config_resolve_matrix_homeserver_url_none_without_config() {
+        let config = RobotConfig {
+            enabled: true,
+            timeout_seconds: Some(300),
+            checkin_interval_seconds: None,
+            telegram: None,
+            rocketchat: None,
+            matrix: None,
+            operator_id: None,
+        };
+
+        let resolved = config.resolve_matrix_homeserver_url();
+        if std::env::var("RALPH_MATRIX_HOMESERVER_URL").is_err() {
+            assert!(resolved.is_none());
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub struct BotArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BotCommands {
-    /// Interactive setup wizard for RObot backend (Telegram or Rocket.Chat)
+    /// Interactive setup wizard for RObot backend (Telegram, Rocket.Chat, or Matrix)
     Onboard(OnboardArgs),
     /// Check current bot configuration status
     Status,
@@ -41,7 +41,7 @@ pub enum BotCommands {
 
 #[derive(Parser, Debug)]
 pub struct OnboardArgs {
-    /// Backend to onboard: "telegram" (default) or "rocketchat"
+    /// Backend to onboard: "telegram" (default), "rocketchat", or "matrix"
     #[arg(long, default_value = "telegram")]
     pub backend: String,
 
@@ -78,6 +78,15 @@ pub struct OnboardArgs {
     /// Operator user ID for filtering messages in group chats
     #[arg(long)]
     pub operator_id: Option<String>,
+
+    // ── Matrix-specific flags ────────────────────────────────────────────
+    /// Matrix homeserver URL (e.g., https://matrix.example.com)
+    #[arg(long)]
+    pub homeserver_url: Option<String>,
+
+    /// Matrix access token (alternative to password login)
+    #[arg(long)]
+    pub access_token: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -101,13 +110,18 @@ pub enum TokenCommands {
 
 #[derive(Parser, Debug)]
 pub struct SetTokenArgs {
-    /// Telegram bot token to store
+    /// Bot token or access token to store
     #[arg(value_name = "TOKEN")]
     pub token: String,
 
     /// Optional config file to update with the token
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Backend to store the token for (telegram, matrix, rocketchat).
+    /// If omitted, auto-detects from ralph.yml; defaults to telegram.
+    #[arg(long)]
+    pub backend: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -127,8 +141,9 @@ pub async fn execute(
         BotCommands::Onboard(onboard_args) => match onboard_args.backend.as_str() {
             "telegram" => onboard_telegram(onboard_args, use_colors).await,
             "rocketchat" => onboard_rocketchat(onboard_args, use_colors).await,
+            "matrix" => onboard_matrix(onboard_args, use_colors).await,
             other => anyhow::bail!(
-                "Unknown backend {:?}. Supported backends: telegram, rocketchat",
+                "Unknown backend {:?}. Supported backends: telegram, rocketchat, matrix",
                 other
             ),
         },
@@ -149,14 +164,51 @@ fn bot_token(args: TokenArgs, use_colors: bool) -> Result<()> {
 
 fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
     let token = args.token;
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ralph.yml"));
+
+    let backend = if let Some(ref b) = args.backend {
+        match b.as_str() {
+            "telegram" => Backend::Telegram,
+            "rocketchat" => Backend::RocketChat,
+            "matrix" => Backend::Matrix,
+            other => anyhow::bail!(
+                "Unknown backend {:?}. Supported: telegram, rocketchat, matrix",
+                other
+            ),
+        }
+    } else {
+        let detected = detect_configured_backend_from(&config_path);
+        if detected == Backend::None {
+            Backend::Telegram
+        } else {
+            detected
+        }
+    };
+
     let mut keychain_ok = false;
 
-    match store_bot_token(&token) {
+    let (store_result, keychain_label) = match backend {
+        Backend::Telegram => (store_bot_token(&token), "ralph/telegram-bot-token"),
+        Backend::Matrix => (
+            store_matrix_access_token(&token),
+            "ralph/matrix-access-token",
+        ),
+        Backend::RocketChat => (
+            store_rocketchat_auth_token(&token),
+            "ralph/rocketchat-auth-token",
+        ),
+        Backend::None => unreachable!(),
+    };
+
+    match store_result {
         Ok(()) => {
             keychain_ok = true;
             print_success(
                 use_colors,
-                "Token stored in OS keychain (ralph/telegram-bot-token)",
+                &format!("Token stored in OS keychain ({keychain_label})"),
             );
         }
         Err(e) => {
@@ -168,11 +220,15 @@ fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
     }
 
     let has_config = args.config.is_some();
-    let config_path = args.config.unwrap_or_else(|| PathBuf::from("ralph.yml"));
 
     let should_write_config = has_config || !keychain_ok;
     if should_write_config {
-        save_bot_token_config(&config_path, &token)?;
+        match backend {
+            Backend::Telegram => save_bot_token_config(&config_path, &token)?,
+            Backend::Matrix => save_matrix_token_config(&config_path, &token)?,
+            Backend::RocketChat => save_rocketchat_token_config(&config_path, &token)?,
+            Backend::None => unreachable!(),
+        }
         print_success(
             use_colors,
             &format!("Token stored in {}", config_path.display()),
@@ -182,7 +238,10 @@ fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
     if !keychain_ok && !has_config {
         print_warning(
             use_colors,
-            "Keychain storage failed; token saved to ralph.yml instead.",
+            &format!(
+                "Keychain storage failed; token saved to {} instead.",
+                config_path.display()
+            ),
         );
     }
 
@@ -591,6 +650,252 @@ async fn onboard_rocketchat(args: OnboardArgs, use_colors: bool) -> Result<()> {
     Ok(())
 }
 
+async fn onboard_matrix(args: OnboardArgs, use_colors: bool) -> Result<()> {
+    use ralph_matrix::{MatrixApi, MatrixClient};
+
+    println!();
+    if use_colors {
+        println!("\x1b[1mRalph Matrix Bot Setup\x1b[0m");
+        println!("\x1b[1m======================\x1b[0m");
+    } else {
+        println!("Ralph Matrix Bot Setup");
+        println!("======================");
+    }
+    println!();
+
+    // Step 1: Get homeserver URL
+    let homeserver_url = if let Some(url) = args.homeserver_url {
+        url
+    } else {
+        println!("Step 1: Matrix homeserver URL");
+        println!("  e.g., https://matrix.example.com");
+        println!();
+        prompt_input("  Homeserver URL: ")?
+    };
+
+    // Step 2: Get access token (or login with password)
+    let access_token = if let Some(tok) = args.access_token {
+        tok
+    } else {
+        println!();
+        println!("Step 2: Authentication");
+        println!("  You can provide an access token directly, or log in with username/password.");
+        println!(
+            "  Access tokens can be found in Element: Settings > Help & About > Access Token."
+        );
+        println!();
+        let token_input =
+            prompt_input_optional("  Access token (or press Enter to use password login): ")?;
+
+        if token_input.is_empty() {
+            // Password login flow
+            println!();
+            let username = prompt_input("  Username (e.g., @bot:example.com or just bot): ")?;
+            let password = prompt_input("  Password: ")?;
+
+            println!();
+            print!("  Logging in with password...");
+            io::stdout().flush()?;
+
+            let client = MatrixClient::new();
+            match client.login(&homeserver_url, &username, &password).await {
+                Ok(()) => {
+                    println!();
+                    print_success(use_colors, "Password login successful!");
+                    println!("    Note: An access token was generated for this session.");
+                    println!("    You should create a dedicated access token for production use.");
+                }
+                Err(e) => {
+                    println!();
+                    print_error(use_colors, &format!("Password login failed: {e}"));
+                    println!();
+                    println!("  Troubleshooting:");
+                    println!("    - Check that homeserver URL is correct and reachable");
+                    println!("    - Verify username and password are correct");
+                    println!("    - Check your internet connection");
+                    anyhow::bail!("Password login failed");
+                }
+            }
+
+            // Password login doesn't give us a portable token to store.
+            // Prompt for an access token instead.
+            println!();
+            println!(
+                "  Password login verified credentials, but an access token is needed for storage."
+            );
+            println!(
+                "  Please provide an access token (Element: Settings > Help & About > Access Token)."
+            );
+            println!();
+            prompt_input("  Access token: ")?
+        } else {
+            token_input
+        }
+    };
+
+    // Step 3: Validate credentials
+    println!();
+    println!("Step 3: Validate credentials");
+    print!("  Checking credentials with Matrix homeserver...");
+    io::stdout().flush()?;
+
+    let client = MatrixClient::new();
+    match client
+        .login_with_token(&homeserver_url, &access_token)
+        .await
+    {
+        Ok(()) => {}
+        Err(e) => {
+            println!();
+            print_error(use_colors, &format!("Credential validation failed: {e}"));
+            println!();
+            println!("  Troubleshooting:");
+            println!("    - Check that homeserver URL is correct and reachable");
+            println!("    - Verify the access token hasn't been revoked");
+            println!("    - Check your internet connection");
+            anyhow::bail!("Credential validation failed");
+        }
+    }
+
+    match client.get_display_name().await {
+        Ok(display_name) => {
+            println!();
+            print_success(
+                use_colors,
+                &format!("Credentials valid! Bot: {}", display_name),
+            );
+        }
+        Err(e) => {
+            println!();
+            print_warning(
+                use_colors,
+                &format!("Logged in but could not fetch display name: {e}"),
+            );
+            println!("    Setup will continue.");
+        }
+    }
+
+    // Step 4: Get room ID
+    let room_id = if let Some(rid) = args.room_id {
+        rid
+    } else {
+        println!();
+        println!("Step 4: Room ID");
+        println!("  The room where Ralph will send messages.");
+        println!("  Find it in Element: Room Settings > Advanced > Internal room ID.");
+        println!("  Format: !abc123:example.com");
+        println!();
+        prompt_input("  Room ID: ")?
+    };
+
+    // Sync + join so the SDK can see the room, then validate
+    let _ = client.ensure_room(&room_id).await;
+    print!("  Checking room...");
+    io::stdout().flush()?;
+    match client.get_room_info(&room_id).await {
+        Ok(room) => {
+            println!();
+            let room_display = room.name.as_deref().unwrap_or(&room_id);
+            let members = room.member_count;
+            print_success(
+                use_colors,
+                &format!("Room found: {} ({} members)", room_display, members),
+            );
+        }
+        Err(e) => {
+            println!();
+            print_warning(use_colors, &format!("Could not validate room: {e}"));
+            println!("    The bot may not have joined. Setup will continue.");
+        }
+    }
+
+    // Step 5: Get operator ID
+    let operator_id = if let Some(oid) = args.operator_id {
+        Some(oid)
+    } else {
+        println!();
+        println!("Step 5: Operator ID (optional)");
+        println!("  In group rooms, only messages from this user are processed.");
+        println!("  Format: @username:example.com");
+        println!("  Leave blank for DMs or if filtering is not needed.");
+        println!();
+        let input = prompt_input_optional("  Operator user ID (or press Enter to skip): ")?;
+        if input.is_empty() { None } else { Some(input) }
+    };
+
+    // Step 6: Save configuration
+    println!();
+    println!("Step 6: Save configuration");
+
+    // Store access token in keychain
+    match store_matrix_access_token(&access_token) {
+        Ok(()) => {
+            print_success(
+                use_colors,
+                "Access token stored in OS keychain (ralph/matrix-access-token)",
+            );
+        }
+        Err(e) => {
+            print_warning(
+                use_colors,
+                &format!("Could not store token in keychain: {e}"),
+            );
+            println!("    Set RALPH_MATRIX_ACCESS_TOKEN env var instead.");
+        }
+    }
+
+    // Update ralph.yml
+    match save_matrix_config(&homeserver_url, &room_id, operator_id.as_deref()) {
+        Ok(()) => {
+            print_success(use_colors, "Updated ralph.yml (RObot.matrix configured)");
+        }
+        Err(e) => {
+            print_warning(use_colors, &format!("Could not update ralph.yml: {e}"));
+            println!("    Add manually:");
+            println!("      RObot:");
+            println!("        enabled: true");
+            println!("        matrix:");
+            println!("          homeserver_url: {}", homeserver_url);
+            println!("          room_id: {}", room_id);
+            if let Some(ref oid) = operator_id {
+                println!("        operator_id: {}", oid);
+            }
+        }
+    }
+
+    // Step 7: Verify
+    println!();
+    println!("Step 7: Verify");
+
+    match client
+        .send_message(
+            &room_id,
+            "Ralph bot setup complete! I'm ready to assist during orchestration runs.",
+            None,
+        )
+        .await
+    {
+        Ok(_) => {
+            print_success(use_colors, "Test message sent to your Matrix room!");
+        }
+        Err(e) => {
+            print_warning(use_colors, &format!("Could not send test message: {e}"));
+            println!("    Setup saved. Verify later with: ralph bot test");
+        }
+    }
+
+    println!();
+    if use_colors {
+        println!(
+            "\x1b[32mSetup complete!\x1b[0m Run `ralph run` to start with Matrix integration."
+        );
+    } else {
+        println!("Setup complete! Run `ralph run` to start with Matrix integration.");
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // STATUS COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
@@ -610,6 +915,7 @@ async fn bot_status(use_colors: bool) -> Result<()> {
 
     match backend {
         Backend::RocketChat => bot_status_rocketchat(use_colors).await,
+        Backend::Matrix => bot_status_matrix(use_colors).await,
         Backend::Telegram => bot_status_telegram(use_colors).await,
         Backend::None => {
             print_error(use_colors, "No RObot backend configured");
@@ -617,6 +923,7 @@ async fn bot_status(use_colors: bool) -> Result<()> {
             println!("  Set up a backend with:");
             println!("    ralph bot onboard --backend telegram");
             println!("    ralph bot onboard --backend rocketchat");
+            println!("    ralph bot onboard --backend matrix");
             Ok(())
         }
     }
@@ -831,6 +1138,143 @@ async fn bot_status_rocketchat(use_colors: bool) -> Result<()> {
     Ok(())
 }
 
+async fn bot_status_matrix(use_colors: bool) -> Result<()> {
+    use ralph_matrix::{MatrixApi, MatrixClient};
+
+    print_success(use_colors, "Backend: Matrix");
+    println!();
+
+    // Load config
+    let config_path = Path::new("ralph.yml");
+    let config = RalphConfig::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    let mx = config
+        .robot
+        .matrix
+        .as_ref()
+        .context("RObot.matrix section missing from ralph.yml")?;
+
+    // Homeserver URL
+    let homeserver_url = config.robot.resolve_matrix_homeserver_url();
+    if let Some(ref url) = homeserver_url {
+        print_success(use_colors, &format!("Homeserver URL: {}", url));
+    } else {
+        print_error(use_colors, "Homeserver URL: not configured");
+    }
+
+    // Access token — keychain
+    let keychain_token = load_matrix_access_token();
+    if keychain_token.is_some() {
+        print_success(use_colors, "Keychain: access token stored");
+    } else {
+        print_status(use_colors, "Keychain: no access token found");
+    }
+
+    // Access token — env var
+    let has_env = std::env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok();
+    if has_env {
+        print_success(use_colors, "Env var: RALPH_MATRIX_ACCESS_TOKEN set");
+    } else {
+        print_status(use_colors, "Env var: RALPH_MATRIX_ACCESS_TOKEN not set");
+    }
+
+    // Access token — config file
+    let config_token = mx.access_token.clone();
+    if config_token.is_some() {
+        print_warning(
+            use_colors,
+            "Config: access_token in ralph.yml (consider migrating to keychain)",
+        );
+    } else {
+        print_status(use_colors, "Config: no access_token in ralph.yml");
+    }
+
+    // Bot user ID
+    if let Some(ref bot_user_id) = mx.bot_user_id {
+        print_success(use_colors, &format!("Bot user ID: {}", bot_user_id));
+    } else {
+        print_status(use_colors, "Bot user ID: not configured");
+    }
+
+    // Room ID
+    if let Some(ref room_id) = mx.room_id {
+        print_success(use_colors, &format!("Room ID: {}", room_id));
+    } else {
+        print_error(use_colors, "Room ID: not configured");
+    }
+
+    // Operator ID
+    if let Some(ref operator_id) = config.robot.operator_id {
+        print_success(use_colors, &format!("Operator ID: {}", operator_id));
+    } else {
+        print_status(
+            use_colors,
+            "Operator ID: not configured (all users can interact)",
+        );
+    }
+
+    // RObot enabled
+    if config.robot.enabled {
+        print_success(use_colors, "RObot: enabled");
+    } else {
+        print_status(use_colors, "RObot: not enabled");
+    }
+
+    // Live validation if we have enough info
+    println!();
+    let effective_token = config.robot.resolve_matrix_access_token();
+    if let (Some(url), Some(token)) = (homeserver_url, effective_token) {
+        print!("  Validating credentials with Matrix homeserver...");
+        io::stdout().flush()?;
+        let client = MatrixClient::new();
+        match client.login_with_token(&url, &token).await {
+            Ok(()) => match client.get_display_name().await {
+                Ok(display_name) => {
+                    println!();
+                    print_success(use_colors, &format!("Bot: {}", display_name));
+                }
+                Err(e) => {
+                    println!();
+                    print_warning(
+                        use_colors,
+                        &format!("Logged in but could not get display name: {e}"),
+                    );
+                }
+            },
+            Err(e) => {
+                println!();
+                print_error(use_colors, &format!("Credential validation failed: {e}"));
+            }
+        }
+
+        // Validate room if configured — sync + join first so the SDK
+        // knows about the room (its local cache is empty after login).
+        if let Some(ref room_id) = mx.room_id {
+            if let Err(e) = client.ensure_room(room_id).await {
+                print_error(use_colors, &format!("Room join/sync failed: {e}"));
+            } else {
+                match client.get_room_info(room_id).await {
+                    Ok(room) => {
+                        let room_name = room.name.as_deref().unwrap_or("(unnamed)");
+                        print_success(use_colors, &format!("Room: {}", room_name));
+                    }
+                    Err(e) => {
+                        print_error(use_colors, &format!("Room validation failed: {e}"));
+                    }
+                }
+            }
+        }
+    } else {
+        print_error(
+            use_colors,
+            "Cannot validate: missing homeserver_url or access_token",
+        );
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TEST COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
@@ -840,6 +1284,7 @@ async fn bot_test(args: TestArgs, use_colors: bool) -> Result<()> {
 
     match backend {
         Backend::RocketChat => bot_test_rocketchat(args, use_colors).await,
+        Backend::Matrix => bot_test_matrix(args, use_colors).await,
         Backend::Telegram => bot_test_telegram(args, use_colors).await,
         Backend::None => {
             print_error(use_colors, "No RObot backend configured");
@@ -847,6 +1292,7 @@ async fn bot_test(args: TestArgs, use_colors: bool) -> Result<()> {
             println!("  Set up a backend with:");
             println!("    ralph bot onboard --backend telegram");
             println!("    ralph bot onboard --backend rocketchat");
+            println!("    ralph bot onboard --backend matrix");
             Ok(())
         }
     }
@@ -934,13 +1380,73 @@ async fn bot_test_rocketchat(args: TestArgs, use_colors: bool) -> Result<()> {
     Ok(())
 }
 
+async fn bot_test_matrix(args: TestArgs, use_colors: bool) -> Result<()> {
+    use ralph_matrix::{MatrixApi, MatrixClient};
+
+    // Load config
+    let config_path = Path::new("ralph.yml");
+    let config = RalphConfig::from_file(config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    let mx = config
+        .robot
+        .matrix
+        .as_ref()
+        .context("RObot.matrix section missing from ralph.yml")?;
+
+    // Resolve credentials
+    let homeserver_url = config
+        .robot
+        .resolve_matrix_homeserver_url()
+        .context("No homeserver_url configured. Run `ralph bot onboard --backend matrix`")?;
+
+    let access_token = config
+        .robot
+        .resolve_matrix_access_token()
+        .context("No access_token configured. Set RALPH_MATRIX_ACCESS_TOKEN or run `ralph bot onboard --backend matrix`")?;
+
+    let room_id = mx
+        .room_id
+        .as_ref()
+        .context("No room_id configured. Run `ralph bot onboard --backend matrix`")?;
+
+    // Connect to homeserver and ensure room is joined
+    let client = MatrixClient::new();
+    client
+        .login_with_token(&homeserver_url, &access_token)
+        .await
+        .context("Failed to authenticate with Matrix homeserver")?;
+
+    client
+        .ensure_room(room_id)
+        .await
+        .context("Failed to sync/join Matrix room")?;
+
+    print!("  Sending message to room {}...", room_id);
+    io::stdout().flush()?;
+
+    match client.send_message(room_id, &args.message, None).await {
+        Ok(_) => {
+            println!();
+            print_success(use_colors, "Message sent!");
+        }
+        Err(e) => {
+            println!();
+            print_error(use_colors, &format!("Failed to send message: {e}"));
+            anyhow::bail!("Send failed");
+        }
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DAEMON COMMAND
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run the bot daemon — delegates to the configured communication adapter.
 ///
-/// Supports Telegram and Rocket.Chat backends. The adapter implements
+/// Supports Telegram, Rocket.Chat, and Matrix backends. The adapter implements
 /// [`DaemonAdapter`] and handles all platform-specific concerns.
 async fn run_daemon(
     _args: DaemonArgs,
@@ -1043,6 +1549,33 @@ async fn run_daemon(
             server_url,
             auth_token,
             bot_user_id,
+            room_id,
+            operator_id,
+        ))
+    } else if let Some(mx) = &config.robot.matrix {
+        let access_token = config
+            .robot
+            .resolve_matrix_access_token()
+            .context("No Matrix access token available. Set RALPH_MATRIX_ACCESS_TOKEN env var or set RObot.matrix.access_token in config")?;
+        let homeserver_url = config
+            .robot
+            .resolve_matrix_homeserver_url()
+            .context("No Matrix homeserver URL available. Set RALPH_MATRIX_HOMESERVER_URL env var or set RObot.matrix.homeserver_url in config")?;
+        let room_id = mx
+            .room_id
+            .clone()
+            .context("RObot.matrix.room_id is required")?;
+        let operator_id = config.robot.operator_id.clone();
+
+        if use_colors {
+            println!("\x1b[1mRalph Daemon\x1b[0m (Matrix)");
+        } else {
+            println!("Ralph Daemon (Matrix)");
+        }
+
+        Box::new(ralph_matrix::daemon::MatrixDaemon::new(
+            homeserver_url,
+            access_token,
             room_id,
             operator_id,
         ))
@@ -1302,6 +1835,32 @@ fn store_rocketchat_auth_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Store Matrix access token in OS keychain.
+fn store_matrix_access_token(token: &str) -> Result<()> {
+    let entry = keyring::Entry::new("ralph", "matrix-access-token")
+        .context("Failed to create keychain entry")?;
+    if let Err(err) = entry.set_password(token) {
+        if entry.delete_credential().is_ok() {
+            entry
+                .set_password(token)
+                .context("Failed to store token in keychain after deleting existing entry")?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "Failed to store token in keychain: {}",
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Load Matrix access token from OS keychain.
+fn load_matrix_access_token() -> Option<String> {
+    keyring::Entry::new("ralph", "matrix-access-token")
+        .ok()
+        .and_then(|e| e.get_password().ok())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1446,6 +2005,76 @@ fn save_rocketchat_config(
     Ok(())
 }
 
+#[allow(dead_code)] // Called by onboard_matrix() in sub-task 5.6
+fn save_matrix_config(
+    homeserver_url: &str,
+    room_id: &str,
+    operator_id: Option<&str>,
+) -> Result<()> {
+    let config_path = Path::new("ralph.yml");
+
+    let mut matrix_map = serde_yaml::Mapping::new();
+    matrix_map.insert(
+        serde_yaml::Value::String("homeserver_url".to_string()),
+        serde_yaml::Value::String(homeserver_url.to_string()),
+    );
+    matrix_map.insert(
+        serde_yaml::Value::String("room_id".to_string()),
+        serde_yaml::Value::String(room_id.to_string()),
+    );
+
+    let mut robot_map = serde_yaml::Mapping::new();
+    robot_map.insert(
+        serde_yaml::Value::String("enabled".to_string()),
+        serde_yaml::Value::Bool(true),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("timeout_seconds".to_string()),
+        serde_yaml::Value::Number(serde_yaml::Number::from(300u64)),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("matrix".to_string()),
+        serde_yaml::Value::Mapping(matrix_map),
+    );
+    if let Some(oid) = operator_id {
+        robot_map.insert(
+            serde_yaml::Value::String("operator_id".to_string()),
+            serde_yaml::Value::String(oid.to_string()),
+        );
+    }
+
+    let robot = serde_yaml::Value::Mapping(robot_map);
+
+    if config_path.exists() {
+        let content = std::fs::read_to_string(config_path).context("Failed to read ralph.yml")?;
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&content).context("Failed to parse ralph.yml")?;
+
+        if let serde_yaml::Value::Mapping(ref mut map) = doc {
+            map.insert(serde_yaml::Value::String("RObot".to_string()), robot);
+        }
+
+        let yaml_str = serde_yaml::to_string(&doc).context("Failed to serialize config")?;
+        std::fs::write(config_path, yaml_str).context("Failed to write ralph.yml")?;
+    } else {
+        let mut lines = vec![
+            "RObot:".to_string(),
+            "  enabled: true".to_string(),
+            "  timeout_seconds: 300".to_string(),
+            "  matrix:".to_string(),
+            format!("    homeserver_url: {}", homeserver_url),
+            format!("    room_id: {}", room_id),
+        ];
+        if let Some(oid) = operator_id {
+            lines.push(format!("  operator_id: {}", oid));
+        }
+        lines.push(String::new()); // trailing newline
+        std::fs::write(config_path, lines.join("\n")).context("Failed to create ralph.yml")?;
+    }
+
+    Ok(())
+}
+
 /// Write resolved config to a temporary runtime file so loop_runner receives a config path.
 fn write_temp_config_for_daemon(workspace_root: &Path, config: &RalphConfig) -> Result<PathBuf> {
     let state_dir = workspace_root.join(".ralph");
@@ -1515,6 +2144,102 @@ fn save_bot_token_config(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Save Matrix access token into a config file, preserving other keys.
+fn save_matrix_token_config(path: &Path, token: &str) -> Result<()> {
+    let doc = if path.exists() {
+        let content = std::fs::read_to_string(path).context("Failed to read config file")?;
+        serde_yaml::from_str(&content).context("Failed to parse config file")?
+    } else {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    };
+
+    let mut root = match doc {
+        serde_yaml::Value::Mapping(map) => map,
+        _ => serde_yaml::Mapping::new(),
+    };
+
+    let robot_key = if root.contains_key("RObot") {
+        serde_yaml::Value::String("RObot".to_string())
+    } else if root.contains_key("robot") {
+        serde_yaml::Value::String("robot".to_string())
+    } else {
+        serde_yaml::Value::String("RObot".to_string())
+    };
+
+    let mut robot_map = match root.get(&robot_key) {
+        Some(serde_yaml::Value::Mapping(map)) => map.clone(),
+        _ => serde_yaml::Mapping::new(),
+    };
+
+    let mut matrix_map = match robot_map.get("matrix") {
+        Some(serde_yaml::Value::Mapping(map)) => map.clone(),
+        _ => serde_yaml::Mapping::new(),
+    };
+    matrix_map.insert(
+        serde_yaml::Value::String("access_token".to_string()),
+        serde_yaml::Value::String(token.to_string()),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("matrix".to_string()),
+        serde_yaml::Value::Mapping(matrix_map),
+    );
+
+    root.insert(robot_key, serde_yaml::Value::Mapping(robot_map));
+
+    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
+        .context("Failed to serialize config")?;
+    std::fs::write(path, yaml_str).context("Failed to write config file")?;
+    Ok(())
+}
+
+/// Save Rocket.Chat auth token into a config file, preserving other keys.
+fn save_rocketchat_token_config(path: &Path, token: &str) -> Result<()> {
+    let doc = if path.exists() {
+        let content = std::fs::read_to_string(path).context("Failed to read config file")?;
+        serde_yaml::from_str(&content).context("Failed to parse config file")?
+    } else {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    };
+
+    let mut root = match doc {
+        serde_yaml::Value::Mapping(map) => map,
+        _ => serde_yaml::Mapping::new(),
+    };
+
+    let robot_key = if root.contains_key("RObot") {
+        serde_yaml::Value::String("RObot".to_string())
+    } else if root.contains_key("robot") {
+        serde_yaml::Value::String("robot".to_string())
+    } else {
+        serde_yaml::Value::String("RObot".to_string())
+    };
+
+    let mut robot_map = match root.get(&robot_key) {
+        Some(serde_yaml::Value::Mapping(map)) => map.clone(),
+        _ => serde_yaml::Mapping::new(),
+    };
+
+    let mut rc_map = match robot_map.get("rocketchat") {
+        Some(serde_yaml::Value::Mapping(map)) => map.clone(),
+        _ => serde_yaml::Mapping::new(),
+    };
+    rc_map.insert(
+        serde_yaml::Value::String("auth_token".to_string()),
+        serde_yaml::Value::String(token.to_string()),
+    );
+    robot_map.insert(
+        serde_yaml::Value::String("rocketchat".to_string()),
+        serde_yaml::Value::Mapping(rc_map),
+    );
+
+    root.insert(robot_key, serde_yaml::Value::Mapping(robot_map));
+
+    let yaml_str = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
+        .context("Failed to serialize config")?;
+    std::fs::write(path, yaml_str).context("Failed to write config file")?;
+    Ok(())
+}
+
 /// Save telegram state with chat_id.
 fn save_telegram_state(chat_id: i64) -> Result<()> {
     let state_dir = Path::new(".ralph");
@@ -1574,14 +2299,15 @@ fn load_config_api_url_from(path: &Path) -> Option<String> {
 pub(crate) enum Backend {
     Telegram,
     RocketChat,
+    Matrix,
     None,
 }
 
 /// Detect which RObot backend is configured in `ralph.yml`.
 ///
-/// Checks the `RObot` (or `robot`) section for `telegram` and `rocketchat`
-/// sub-keys. Returns [`Backend::None`] if neither is present or the config
-/// file cannot be read.
+/// Checks the `RObot` (or `robot`) section for `rocketchat`, `matrix`, and `telegram`
+/// sub-keys. Returns [`Backend::None`] if none is present or the config
+/// file cannot be read. Priority: rocketchat > matrix > telegram.
 pub(crate) fn detect_configured_backend() -> Backend {
     detect_configured_backend_from(Path::new("ralph.yml"))
 }
@@ -1605,11 +2331,13 @@ fn detect_configured_backend_from(path: &Path) -> Backend {
     };
 
     let has_rc = robot.get("rocketchat").is_some();
+    let has_matrix = robot.get("matrix").is_some();
     let has_tg = robot.get("telegram").is_some();
 
-    match (has_rc, has_tg) {
-        (true, _) => Backend::RocketChat,
-        (false, true) => Backend::Telegram,
+    match (has_rc, has_matrix, has_tg) {
+        (true, _, _) => Backend::RocketChat,
+        (_, true, _) => Backend::Matrix,
+        (_, _, true) => Backend::Telegram,
         _ => Backend::None,
     }
 }
@@ -2365,6 +3093,56 @@ mod tests {
         assert_eq!(detect_configured_backend_from(&config_path), Backend::None);
     }
 
+    #[test]
+    fn test_detect_backend_matrix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  enabled: true\n  matrix:\n    homeserver_url: https://matrix.example.com\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::Matrix
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_matrix_and_telegram() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  telegram:\n    bot_token: tok\n  matrix:\n    homeserver_url: https://matrix.example.com\n",
+        )
+        .unwrap();
+
+        // matrix takes priority over telegram (rc > matrix > tg)
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::Matrix
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_rc_wins_over_matrix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("ralph.yml");
+        std::fs::write(
+            &config_path,
+            "RObot:\n  matrix:\n    homeserver_url: https://matrix.example.com\n  rocketchat:\n    server_url: https://rc.example.com\n",
+        )
+        .unwrap();
+
+        // rocketchat takes priority over matrix (rc > matrix > tg)
+        assert_eq!(
+            detect_configured_backend_from(&config_path),
+            Backend::RocketChat
+        );
+    }
+
     // ── onboard argument routing tests ─────────────────────────────────
 
     fn parse_bot_args(args: &[&str]) -> BotArgs {
@@ -2465,6 +3243,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_onboard_backend_matrix() {
+        let bot = parse_bot_args(&["onboard", "--backend", "matrix"]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "matrix");
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_matrix_specific_flags() {
+        let bot = parse_bot_args(&[
+            "onboard",
+            "--backend",
+            "matrix",
+            "--homeserver-url",
+            "https://matrix.example.com",
+            "--access-token",
+            "syt_secret_token_123",
+            "--room-id",
+            "!room123:example.com",
+            "--operator-id",
+            "@user:example.com",
+        ]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "matrix");
+                assert_eq!(
+                    args.homeserver_url.as_deref(),
+                    Some("https://matrix.example.com")
+                );
+                assert_eq!(args.access_token.as_deref(), Some("syt_secret_token_123"));
+                assert_eq!(args.room_id.as_deref(), Some("!room123:example.com"));
+                assert_eq!(args.operator_id.as_deref(), Some("@user:example.com"));
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
+    #[test]
+    fn test_onboard_matrix_flags_default_to_none() {
+        let bot = parse_bot_args(&["onboard", "--backend", "matrix"]);
+        match bot.command {
+            BotCommands::Onboard(ref args) => {
+                assert_eq!(args.backend, "matrix");
+                assert!(args.homeserver_url.is_none());
+                assert!(args.access_token.is_none());
+                assert!(args.room_id.is_none());
+                assert!(args.operator_id.is_none());
+            }
+            _ => panic!("expected Onboard command"),
+        }
+    }
+
     #[tokio::test]
     async fn test_execute_onboard_unknown_backend_errors() {
         let args = BotArgs {
@@ -2478,6 +3312,8 @@ mod tests {
                 auth_token: None,
                 room_id: None,
                 operator_id: None,
+                homeserver_url: None,
+                access_token: None,
             }),
         };
         let err = execute(args, &[], None, false)

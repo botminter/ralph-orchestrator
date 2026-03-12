@@ -36,6 +36,7 @@ ralph-core       → Orchestration logic, event loop, hats, memories, tasks
 ralph-adapters   → Backend integrations (Claude, Kiro, Gemini, Codex, Roo, etc.)
 ralph-telegram   → Telegram bot for human-in-the-loop communication
 ralph-rocketchat → Rocket.Chat bot for human-in-the-loop communication
+ralph-matrix     → Matrix bot for human-in-the-loop communication
 ralph-tui        → Terminal UI (ratatui-based)
 ralph-e2e        → End-to-end test framework
 ralph-proto      → Protocol definitions
@@ -56,6 +57,7 @@ frontend/        → Web dashboard (@ralph-web/dashboard) - React + Vite + Tailw
 | `.ralph/merge-queue.jsonl` | Event-sourced merge queue |
 | `.ralph/telegram-state.json` | Telegram bot state (chat ID, pending questions) |
 | `.ralph/rocketchat-state.json` | Rocket.Chat bot state (last synced timestamp, pending questions) |
+| `.ralph/matrix-state.json` | Matrix bot state (room ID, pending questions) |
 
 ### Code Locations
 
@@ -69,7 +71,8 @@ frontend/        → Web dashboard (@ralph-web/dashboard) - React + Vite + Tailw
 - **CLI commands**: `crates/ralph-cli/src/loops.rs`, `task_cli.rs`
 - **Telegram integration**: `crates/ralph-telegram/src/` (bot, service, state, handler)
 - **Rocket.Chat integration**: `crates/ralph-rocketchat/src/` (client, service, daemon, handler, state, commands)
-- **RObot config**: `crates/ralph-core/src/config.rs` (`RobotConfig`, `TelegramBotConfig`, `RocketChatConfig`)
+- **Matrix integration**: `crates/ralph-matrix/src/` (client, service, daemon, handler, state, commands)
+- **RObot config**: `crates/ralph-core/src/config.rs` (`RobotConfig`, `TelegramBotConfig`, `RocketChatConfig`, `MatrixConfig`)
 - **Web server**: `backend/ralph-web-server/src/` (tRPC routes in `api/`, runners in `runner/`)
 - **Web dashboard**: `frontend/ralph-web/src/` (React components in `components/`)
 
@@ -180,7 +183,7 @@ Reports generated in `.e2e-tests/`.
 
 ## RObot (Human-in-the-Loop)
 
-Ralph supports human interaction during orchestration via Telegram or Rocket.Chat. Agents can ask questions and humans can send proactive guidance. Configure exactly one backend — both cannot be active simultaneously.
+Ralph supports human interaction during orchestration via Telegram, Rocket.Chat, or Matrix. Agents can ask questions and humans can send proactive guidance. Configure exactly one backend — multiple cannot be active simultaneously.
 
 ### Configuration
 
@@ -207,6 +210,19 @@ RObot:
     room_id: "room-id"
 ```
 
+```yaml
+# ralph.yml — Matrix backend
+RObot:
+  enabled: true
+  timeout_seconds: 300
+  operator_id: "your-matrix-user-id"  # Filter messages to this operator (optional)
+  matrix:
+    homeserver_url: "https://matrix.example.com"  # Or set RALPH_MATRIX_HOMESERVER_URL env var
+    access_token: "your-access-token"             # Or set RALPH_MATRIX_ACCESS_TOKEN env var
+    room_id: "!room:example.com"
+    bot_user_id: "@bot:example.com"
+```
+
 ### Event Types
 
 | Event / Command | Direction | Purpose |
@@ -223,10 +239,10 @@ RObot:
 - Responses are published as `human.response` events on the bus
 - Proactive messages become `human.guidance` events, squashed into a numbered list in the prompt
 - Send failures retry with exponential backoff (3 attempts); if all fail, treated as timeout
-- Parallel loops route messages via reply-to (Telegram) or thread `tmid` (Rocket.Chat), `@loop-id` prefix, or default to primary
+- Parallel loops route messages via reply-to (Telegram, Matrix) or thread `tmid` (Rocket.Chat), `@loop-id` prefix, or default to primary
 - `operator_id` filters messages in group chats to only process the designated human operator
 
-See `crates/ralph-telegram/README.md` or `crates/ralph-rocketchat/README.md` for setup instructions.
+See `crates/ralph-telegram/README.md`, `crates/ralph-rocketchat/README.md`, or `crates/ralph-matrix/README.md` for setup instructions.
 
 ## Diagnostics
 

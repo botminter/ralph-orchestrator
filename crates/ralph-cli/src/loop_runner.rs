@@ -21,6 +21,8 @@ use ralph_core::{
 };
 use ralph_proto::{Event, GuidanceTarget, HatId, RpcEvent, RpcState, RpcTaskCounts};
 use ralph_tui::Tui;
+// MatrixApi trait must be in scope for login_with_token() on MatrixClient.
+use ralph_matrix::MatrixApi as _;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufWriter, IsTerminal, stdin, stdout};
@@ -206,7 +208,7 @@ pub async fn run_loop_impl(
     // Inject robot service (Telegram) for human-in-the-loop communication
     if config.robot.enabled
         && ctx.is_primary()
-        && let Some(service) = create_robot_service(&config, &ctx)
+        && let Some(service) = create_robot_service(&config, &ctx).await
     {
         event_loop.set_robot_service(service);
     }
@@ -4842,11 +4844,13 @@ pub async fn start_loop(
     .await
 }
 
-/// Creates a robot service (Telegram) for human-in-the-loop communication.
+/// Creates a robot service (Rocket.Chat, Matrix, or Telegram) for human-in-the-loop communication.
 ///
 /// Called by `run_loop_impl` when `robot.enabled` is true and this is the primary loop.
 /// Returns `None` if the service cannot be created or started.
-fn create_robot_service(
+///
+/// Detection priority: Rocket.Chat > Matrix > Telegram.
+async fn create_robot_service(
     config: &RalphConfig,
     context: &LoopContext,
 ) -> Option<Box<dyn ralph_proto::RobotService>> {
@@ -4894,6 +4898,56 @@ fn create_robot_service(
             auth_token = %service.auth_token_masked(),
             timeout_secs = service.timeout_secs(),
             "Robot human-in-the-loop service active (Rocket.Chat)"
+        );
+        return Some(Box::new(service));
+    }
+
+    // Matrix backend
+    if let Some(matrix_config) = &config.robot.matrix {
+        let workspace_root = context.workspace().to_path_buf();
+
+        let access_token = config
+            .robot
+            .resolve_matrix_access_token()
+            .unwrap_or_default();
+        let homeserver_url = config
+            .robot
+            .resolve_matrix_homeserver_url()
+            .unwrap_or_default();
+        let room_id = matrix_config.room_id.clone().unwrap_or_default();
+        let operator_id = config.robot.operator_id.clone();
+
+        let client = ralph_matrix::MatrixClient::new();
+        if let Err(e) = client
+            .login_with_token(&homeserver_url, &access_token)
+            .await
+        {
+            warn!(error = %e, "Failed to authenticate Matrix client");
+            return None;
+        }
+
+        if let Err(e) = client.ensure_room(&room_id).await {
+            warn!(error = %e, "Failed to sync/join Matrix room");
+            return None;
+        }
+
+        let client = Arc::new(client);
+        let service = ralph_matrix::MatrixService::new(
+            workspace_root,
+            room_id,
+            operator_id,
+            timeout_secs,
+            loop_id,
+            client,
+        );
+
+        if let Err(e) = service.start() {
+            warn!(error = %e, "Failed to start Matrix robot service");
+            return None;
+        }
+        info!(
+            timeout_secs = service.timeout_secs(),
+            "Robot human-in-the-loop service active (Matrix)"
         );
         return Some(Box::new(service));
     }

@@ -3029,7 +3029,6 @@ mod tests {
                 json: false,
                 ts: Some("2026-03-09T00:00:00Z".to_string()),
                 file: PathBuf::from(".ralph/events.jsonl"),
-                ralph_root: None,
             },
             Some(&workspace),
         )

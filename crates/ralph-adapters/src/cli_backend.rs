@@ -675,39 +675,25 @@ impl CliBackend {
                 // Only headless roo() has --print in args; roo_interactive() does not
                 if self.command == "roo" && args.contains(&"--print".to_string()) {
                     Self::build_roo_prompt_file(&mut args, prompt)
-                } else {
-                    // Handle large prompts for Claude (>7000 chars)
-                    let (prompt_text, temp_file) = if self.command == "claude"
-                        && prompt.len() > 7000
-                    {
-                        // Write to temp file and instruct Claude to read it
-                        match NamedTempFile::new() {
-                            Ok(mut file) => {
-                                if let Err(e) = file.write_all(prompt.as_bytes()) {
-                                    tracing::warn!("Failed to write prompt to temp file: {}", e);
-                                    (prompt.to_string(), None)
-                                } else {
-                                    let path = file.path().display().to_string();
-                                    (
-                                        format!("Please read and execute the task in {}", path),
-                                        Some(file),
-                                    )
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to create temp file: {}", e);
-                                (prompt.to_string(), None)
-                            }
-                        }
-                    } else {
-                        (prompt.to_string(), None)
-                    };
-
+                } else if self.command == "claude" && prompt.len() > 7000 {
+                    // Pass large prompts via --append-system-prompt (inline text)
+                    // to avoid shell argument issues with -p for very long strings.
+                    // The -p flag still drives non-interactive (print) mode.
+                    args.push("--append-system-prompt".to_string());
+                    args.push(prompt.to_string());
                     if let Some(ref flag) = self.prompt_flag {
                         args.push(flag.clone());
                     }
-                    args.push(prompt_text);
-                    (None, temp_file)
+                    args.push(
+                        "Follow the instructions appended to your system prompt.".to_string(),
+                    );
+                    (None, None)
+                } else {
+                    if let Some(ref flag) = self.prompt_flag {
+                        args.push(flag.clone());
+                    }
+                    args.push(prompt.to_string());
+                    (None, None)
                 }
             }
             PromptMode::Stdin => (Some(prompt.to_string()), None),
@@ -841,17 +827,39 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_large_prompt_uses_temp_file() {
-        // With -p mode, large prompts (>7000 chars) use temp file to avoid CLI issues
+    fn test_claude_large_prompt_uses_append_system_prompt() {
+        // With -p mode, large prompts (>7000 chars) use --append-system-prompt
         let backend = CliBackend::claude();
         let large_prompt = "x".repeat(7001);
         let (cmd, args, _stdin, temp) = backend.build_command(&large_prompt, false);
 
         assert_eq!(cmd, "claude");
-        // Should have temp file for large prompts
-        assert!(temp.is_some());
-        // Args should contain instruction to read from temp file
-        assert!(args.iter().any(|a| a.contains("Please read and execute")));
+        // No temp file needed — content is passed inline
+        assert!(temp.is_none());
+        // Args should contain --append-system-prompt followed by the prompt content
+        let asp_idx = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("Should use --append-system-prompt flag");
+        assert_eq!(
+            args[asp_idx + 1],
+            large_prompt,
+            "Prompt content should follow --append-system-prompt inline"
+        );
+        // -p flag should still be present (drives non-interactive mode)
+        let p_idx = args
+            .iter()
+            .position(|a| a == "-p")
+            .expect("Should still have -p flag for non-interactive mode");
+        assert!(
+            p_idx > asp_idx,
+            "-p should come after --append-system-prompt"
+        );
+        // -p prompt should be the short instruction
+        assert!(
+            args[p_idx + 1].contains("Follow the instructions"),
+            "Should have short -p instruction"
+        );
     }
 
     #[test]

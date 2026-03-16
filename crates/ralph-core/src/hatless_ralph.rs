@@ -258,7 +258,9 @@ impl HatlessRalph {
     ///
     /// For solo mode (no hats), pass an empty slice: `&[]`
     pub fn build_prompt(&self, context: &str, active_hats: &[&ralph_proto::Hat]) -> String {
-        let mut prompt = self.core_prompt();
+        // Coordinator mode: hats exist but none are active — Ralph should delegate, not implement
+        let is_coordinating = self.hat_topology.is_some() && active_hats.is_empty();
+        let mut prompt = self.core_prompt(is_coordinating);
 
         // Inject skill index between GUARDRAILS and OBJECTIVE
         if !self.skill_index.is_empty() {
@@ -347,7 +349,7 @@ You MUST NOT get distracted by workflow mechanics — they serve this goal.
         !path.exists()
     }
 
-    fn core_prompt(&self) -> String {
+    fn core_prompt(&self, is_coordinating: bool) -> String {
         // Adapt guardrails based on whether scratchpad or memories mode is active
         let guardrails = self
             .core
@@ -369,7 +371,27 @@ You MUST NOT get distracted by workflow mechanics — they serve this goal.
             .collect::<Vec<_>>()
             .join("\n");
 
-        let mut prompt = if self.memories_enabled {
+        let mut prompt = if is_coordinating {
+            // Coordinator mode: Ralph has hats but none are active — delegation framing
+            if self.memories_enabled {
+                r"
+### 0a. ORIENTATION
+You are Ralph, the coordinator. You are running in a loop. You have fresh context each iteration.
+You MUST NOT implement work directly — your job is to plan and delegate to specialized hats via events.
+
+**First thing every iteration:**
+1. Review your `<scratchpad>` (auto-injected above) for context on your thinking
+2. Review your `<ready-tasks>` (auto-injected above) to see what work exists
+3. Plan and create tasks if needed, then delegate by emitting an event to the appropriate hat.
+"
+            } else {
+                r"
+### 0a. ORIENTATION
+You are Ralph, the coordinator. You are running in a loop. You have fresh context each iteration.
+You MUST NOT implement work directly — your job is to plan and delegate to specialized hats via events.
+"
+            }
+        } else if self.memories_enabled {
             r"
 ### 0a. ORIENTATION
 You are Ralph. You are running in a loop. You have fresh context each iteration.
@@ -999,10 +1021,19 @@ hats:
 
         let prompt = ralph.build_prompt("", &[]);
 
-        // Identity with RFC2119 style
-        assert!(prompt.contains(
-            "You are Ralph. You are running in a loop. You have fresh context each iteration."
-        ));
+        // Coordinator identity — orientation must reinforce delegation, not implementation
+        assert!(
+            prompt.contains("You are Ralph, the coordinator."),
+            "Coordinator mode should identify Ralph as coordinator"
+        );
+        assert!(
+            prompt.contains("You MUST NOT implement work directly"),
+            "Coordinator orientation must reinforce delegation"
+        );
+        assert!(
+            !prompt.contains("You MUST complete only one atomic task"),
+            "Coordinator mode must NOT use implementation-oriented framing"
+        );
 
         // Orientation phases
         assert!(prompt.contains("### 0a. ORIENTATION"));

@@ -20,10 +20,10 @@ exclude = [
 
 [workspace.package]
 edition = "2024"
-version = "2.8.1"
+version = "2.8.1-bm.137b1b3.1"
 license = "MIT"
-repository = "https://github.com/mikeyobrien/ralph-orchestrator"
-homepage = "https://github.com/mikeyobrien/ralph-orchestrator"
+repository = "https://github.com/botminter/ralph-orchestrator"
+homepage = "https://github.com/botminter/ralph-orchestrator"
 description = "Ralph Orchestrator - Multi-agent orchestration framework"
 
 [workspace.lints.rust]
@@ -140,24 +140,24 @@ vt100 = "0.15"
 scopeguard = "1"
 strip-ansi-escapes = "0.2"
 
-# Internal crates (version required for crates.io publishing)
-ralph-proto = { version = "2.8.1", path = "crates/ralph-proto" }
-ralph-core = { version = "2.8.1", path = "crates/ralph-core", features = ["recording"] }
-ralph-adapters = { version = "2.8.1", path = "crates/ralph-adapters" }
-ralph-tui = { version = "2.8.1", path = "crates/ralph-tui" }
-ralph-cli = { version = "2.8.1", path = "crates/ralph-cli" }
-ralph-bench = { version = "2.8.1", path = "crates/ralph-bench" }
-ralph-e2e = { version = "2.8.1", path = "crates/ralph-e2e" }
-ralph-telegram = { version = "2.8.1", path = "crates/ralph-telegram" }
-ralph-rocketchat = { version = "2.8.0", path = "crates/ralph-rocketchat" }
-ralph-matrix = { version = "2.8.0", path = "crates/ralph-matrix" }
-ralph-api = { version = "2.8.1", path = "crates/ralph-api" }
+# Internal crates — use = for exact pre-release match
+ralph-proto = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-proto" }
+ralph-core = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-core", features = ["recording"] }
+ralph-adapters = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-adapters" }
+ralph-tui = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-tui" }
+ralph-cli = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-cli" }
+ralph-bench = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-bench" }
+ralph-e2e = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-e2e" }
+ralph-telegram = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-telegram" }
+ralph-rocketchat = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-rocketchat" }
+ralph-matrix = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-matrix" }
+ralph-api = { version = "=2.8.1-bm.137b1b3.1", path = "crates/ralph-api" }
 
 # Telegram bot framework
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 
-# Matrix SDK
-matrix-sdk = { version = "0.16", default-features = false, features = ["native-tls"] }
+# Matrix SDK (rustls for cross-compilation and to avoid openssl recursion limit issues)
+matrix-sdk = { version = "0.16", default-features = false, features = ["rustls-tls"] }
 
 # Config for 'dist'
 [workspace.metadata.dist]

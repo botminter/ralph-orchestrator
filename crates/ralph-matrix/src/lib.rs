@@ -1,3 +1,7 @@
+// matrix-sdk 0.16's async fn body exceeds rustc's default query depth limit (128)
+// in release/dist profile on Rust 1.94+. See: https://github.com/zeroclaw-labs/zeroclaw/pull/3512
+#![recursion_limit = "256"]
+
 pub mod client;
 pub mod commands;
 pub mod daemon;
